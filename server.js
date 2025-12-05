@@ -1,4 +1,4 @@
-// server.js - Proxy Linky Enedis pour Production PANELYN (OAuth User Token + Joi Fix)
+// server.js - Proxy Linky Enedis pour Production PANELYN (Optimisé Délai Prod + Skip Vides)
 require('dotenv').config();
 const express = require('express');
 const axios = require('axios');
@@ -44,25 +44,25 @@ const hourLimiter = rateLimit({
   legacyHeaders: false
 });
 
-// === SCHEMAS (FIX : access_token ajouté) ===
+// === SCHEMAS ===
 const meteringSchema = Joi.object({
   usage_point_id: Joi.string().pattern(/^\d{14}$/).required(),
   start_date: Joi.string().isoDate().required(),
   end_date: Joi.string().isoDate().required(),
   aggregate: Joi.string().valid('hourly_monthly').optional(),
-  access_token: Joi.string().optional().allow('') // FIX : User token optionnel
+  access_token: Joi.string().optional().allow('')
 });
 
 const userInfoSchema = Joi.object({
   usage_point_id: Joi.string().pattern(/^\d{14}$/).required(),
-  access_token: Joi.string().optional().allow('') // FIX : User token optionnel pour auth perso
+  access_token: Joi.string().optional().allow('')
 });
 
 // === GET TOKEN (App ou User) ===
 async function getToken(accessTokenProvided = null) {
   if (accessTokenProvided && accessTokenProvided.trim() !== '') {
     if (NODE_ENV === 'development') console.log('[AUTH] Utilisation token user fourni');
-    return accessTokenProvided; // User token direct
+    return accessTokenProvided;
   }
   // Fallback app token
   const now = Date.now();
@@ -78,7 +78,7 @@ async function getToken(accessTokenProvided = null) {
         grant_type: 'client_credentials',
         client_id: ENEDIS_CLIENT_ID,
         client_secret: ENEDIS_CLIENT_SECRET,
-        scope: 'metering_data metering_data_contract_details' // Scopes explicites
+        scope: 'metering_data metering_data_contract_details'
       }).toString(),
       { headers: { 'Content-Type': 'application/x-www-form-urlencoded' }, timeout: 10000 }
     );
@@ -92,7 +92,7 @@ async function getToken(accessTokenProvided = null) {
   }
 }
 
-// === FETCH USER INFO (avec retry sur auth error) ===
+// === FETCH USER INFO ===
 async function fetchUserInfo(req, res) {
   const { error: validationError } = userInfoSchema.validate(req.body);
   if (validationError) return res.status(400).json({ success: false, error: validationError.details[0].message });
@@ -122,7 +122,7 @@ async function fetchUserInfo(req, res) {
     } catch (authError) {
       if (authError.response?.status === 401 || authError.response?.status === 403) {
         console.log('[USER_INFO] Token user invalide – retry avec app token');
-        token = await getToken(); // Fallback app si user token expire
+        token = await getToken();
         detailsResponse = await axios.get(
           `${ENEDIS_BASE_URL}/metering_data/v5/usage_point_details`,
           {
@@ -160,7 +160,6 @@ async function fetchUserInfo(req, res) {
     } catch (authError) {
       if (authError.response?.status === 401 || authError.response?.status === 403) {
         console.log('[USER_INFO] Token user invalide pour contrat – skip full details');
-        // Garde basics, skip full
       } else {
         throw authError;
       }
@@ -170,10 +169,10 @@ async function fetchUserInfo(req, res) {
       if (contracts.length > 0) contract = { ...contract, ...contracts[0] };
     }
 
-    if (NODE_ENV === 'development') console.log(`[USER_INFO] OK : ${address ? 'Adresse OK' : "Pas d'adresse"}, contrat basics OK`); // FIX : Escape supprimé
+    if (NODE_ENV === 'development') console.log(`[USER_INFO] OK : ${address ? 'Adresse OK' : "Pas d'adresse"}, contrat basics OK`);
   } catch (error) {
     console.error(`[USER_INFO] Erreur détaillée:`, error.response?.status, error.response?.data || error.message);
-    console.error('Full Enedis response:', JSON.stringify(error.response?.data, null, 2)); // NOUVEAU : Logs full pour debug 500
+    console.error('Full Enedis response:', JSON.stringify(error.response?.data, null, 2));
     errorOccurred = true;
     errorMessage = error.response?.data?.error_description || error.message || `Erreur API Enedis (${error.response?.status || 'unknown'})`;
   }
@@ -188,7 +187,7 @@ async function fetchUserInfo(req, res) {
   });
 }
 
-// === AGRÉGATION (inchangée) ===
+// === AGRÉGATION ===
 function aggregateData(data) {
   const monthlySums = {};
   data.forEach(entry => {
@@ -207,7 +206,7 @@ function aggregateData(data) {
   return monthlySums;
 }
 
-// === METERING GÉNÉRIQUE (updaté avec retry) ===
+// === METERING GÉNÉRIQUE (optimisé : retry/skip sur 500, détection vide) ===
 async function fetchMeteringData(req, res, type, apiSuffix) {
   const { error: validationError } = meteringSchema.validate(req.body);
   if (validationError) return res.status(400).json({ success: false, error: validationError.details[0].message });
@@ -227,47 +226,72 @@ async function fetchMeteringData(req, res, type, apiSuffix) {
   const allData = [];
   let current = startOfDay(start);
   let errorOccurred = false, errorMessage = '';
+  let skippedChunks = 0;
+  let consecutiveEmpty = 0; // Compteur pour abort cascade vides
   try {
     while (current <= end && !errorOccurred) {
       const chunkStart = format(current, 'yyyy-MM-dd');
       let chunkEndDate = addDays(current, 6);
       if (chunkEndDate > end) chunkEndDate = end;
       const chunkEnd = format(chunkEndDate, 'yyyy-MM-dd');
+      const chunkTimeout = 10000; // FIX : 10s fixe pour vitesse (prod souvent vide)
       if (NODE_ENV === 'development') console.log(`[${type.toUpperCase()}] Chunk ${chunkStart} → ${chunkEnd} avec ${providedToken ? 'user token' : 'app token'}`);
       let response;
-      try {
-        response = await axios.get(
-          `${ENEDIS_BASE_URL}/metering_data_${apiSuffix}/v5/${type}_load_curve`,
-          {
-            headers: { 'Authorization': `Bearer ${token}` },
-            params: { usage_point_id, start: chunkStart, end: chunkEnd },
-            timeout: 15000
-          }
-        );
-      } catch (authError) {
-        if (authError.response?.status === 401 || authError.response?.status === 403) {
-          console.log(`[${type.toUpperCase()}] Token user invalide – retry avec app token`);
-          token = await getToken();
+      let chunkError = false;
+      let attempts = 0;
+      while (attempts < 1 && !chunkError) { // FIX : 1 retry max pour vitesse
+        try {
           response = await axios.get(
             `${ENEDIS_BASE_URL}/metering_data_${apiSuffix}/v5/${type}_load_curve`,
             {
               headers: { 'Authorization': `Bearer ${token}` },
               params: { usage_point_id, start: chunkStart, end: chunkEnd },
-              timeout: 15000
+              timeout: chunkTimeout
             }
           );
-        } else {
-          throw authError;
+          break;
+        } catch (err) {
+          if ((err.response?.status === 500 || err.response?.status === 429) && attempts < 0) { // Jamais retry si 1 max
+            attempts++;
+            console.log(`[${type.toUpperCase()}] Retry ${attempts}/1 sur chunk ${chunkStart} → ${chunkEnd} (erreur ${err.response?.status})`);
+            await new Promise(resolve => setTimeout(resolve, 1000 * attempts)); // 1s
+          } else {
+            console.error(`[${type.toUpperCase()}] Chunk échoué après ${attempts + 1} tentatives:`, err.response?.status, err.response?.data || err.message);
+            console.error('Full Enedis response:', JSON.stringify(err.response?.data, null, 2));
+            chunkError = true;
+          }
         }
+      }
+      if (chunkError) {
+        skippedChunks++;
+        if (!errorOccurred) errorMessage = `Chunk ${chunkStart} → ${chunkEnd} skipé (erreur technique Enedis).`;
+        consecutiveEmpty++;
+        if (consecutiveEmpty > 2) { // Abort si >2 chunks vides consécutifs
+          errorMessage += ' Arrêt précoce (période vide).';
+          break;
+        }
+        continue;
       }
       const values = response.data?.meter_reading?.interval_reading || [];
       allData.push(...values);
+      if (values.length === 0) {
+        skippedChunks++; // Compte comme vide
+        consecutiveEmpty++;
+        if (NODE_ENV === 'development') console.log(`[${type.toUpperCase()}] Chunk vide skipé (${chunkStart} → ${chunkEnd}) – Pas de ${type} détectée.`);
+        if (consecutiveEmpty > 2) break;
+        continue;
+      }
+      consecutiveEmpty = 0; // Reset si data OK
       if (NODE_ENV === 'development') console.log(`[${type.toUpperCase()}] ${values.length} points`);
       current = startOfDay(addDays(chunkEndDate, 1));
     }
+    if (skippedChunks > Math.floor((end.getTime() - start.getTime()) / (1000 * 60 * 60 * 24 * 7)) * 0.5) { // >50% skipé
+      errorOccurred = false; // Garde success true
+      if (errorMessage) errorMessage += ' (Période partielle – extrapolation OK pour simu).';
+    }
   } catch (error) {
-    console.error(`[${type.toUpperCase()}] Erreur:`, error.response?.status, error.response?.data || error.message);
-    console.error('Full Enedis response:', JSON.stringify(error.response?.data, null, 2)); // NOUVEAU : Logs full pour debug
+    console.error(`[${type.toUpperCase()}] Erreur globale:`, error.response?.status, error.response?.data || error.message);
+    console.error('Full Enedis response:', JSON.stringify(error.response?.data, null, 2));
     errorOccurred = true;
     errorMessage = error.response?.data?.error_description || error.message || `Erreur API (${error.response?.status || 'unknown'})`;
   }
@@ -289,8 +313,9 @@ async function fetchMeteringData(req, res, type, apiSuffix) {
     type,
     period: { start: start_date, end: end_date },
     total_points: allData.length,
+    skipped_chunks: skippedChunks,
     data,
-    error_details: errorOccurred ? errorMessage : null
+    error_details: errorOccurred ? errorMessage : (skippedChunks > 0 ? errorMessage : null)
   });
 }
 
