@@ -187,24 +187,25 @@ async function fetchUserInfo(req, res) {
   });
 }
 
-// === AGRÉGATION ===
+// === AGRÉGATION (CORRIGÉE : *0.5 pour convertir W → Wh sur 30 min) ===
 function aggregateData(data) {
-  const monthlySums = {};
-  data.forEach(entry => {
-    if (!entry.date || entry.date === "null") return;
-    const dateObj = new Date(entry.date);
-    if (isNaN(dateObj.getTime())) return;
-    const monthKey = `${dateObj.getFullYear()}-${String(dateObj.getMonth() + 1).padStart(2, '0')}`;
-    const hourKey = String(dateObj.getHours()).padStart(2, '0');
-    if (!monthlySums[monthKey]) monthlySums[monthKey] = Array(24).fill(0);
-    let value = isNaN(parseFloat(entry.value)) ? 0 : parseFloat(entry.value);
-    monthlySums[monthKey][parseInt(hourKey)] += value;
-  });
-  Object.keys(monthlySums).forEach(month => {
-    monthlySums[month] = monthlySums[month].map(v => Math.round(v * 100) / 100);
-  });
-  return monthlySums;
-}
+    const monthlySums = {};
+    data.forEach(entry => {
+      if (!entry.date || entry.date === "null") return;
+      const dateObj = new Date(entry.date);
+      if (isNaN(dateObj.getTime())) return;
+      const monthKey = `${dateObj.getFullYear()}-${String(dateObj.getMonth() + 1).padStart(2, '0')}`;
+      const hourKey = String(dateObj.getHours()).padStart(2, '0');
+      if (!monthlySums[monthKey]) monthlySums[monthKey] = Array(24).fill(0);
+      let value = isNaN(parseFloat(entry.value)) ? 0 : parseFloat(entry.value);
+      // FIX : Multiplier par 0.5 pour énergie en Wh (intervalle 30 min = 0.5 h)
+      monthlySums[monthKey][parseInt(hourKey)] += value * 0.5;
+    });
+    Object.keys(monthlySums).forEach(month => {
+      monthlySums[month] = monthlySums[month].map(v => Math.round(v * 100) / 100);
+    });
+    return monthlySums;
+  }
 
 // === METERING GÉNÉRIQUE (optimisé : retry/skip sur 500, détection vide) ===
 async function fetchMeteringData(req, res, type, apiSuffix) {
