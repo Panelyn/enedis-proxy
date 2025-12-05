@@ -1,12 +1,11 @@
-// server.js - Proxy Linky Enedis pour Production PANELYN (Optimisé Délai Prod + Skip Vides)
+// server.js - Proxy Linky Enedis pour Production PANELYN (Optimisé + Ajustement Proportionnel via daily_consumption/production + Parsing Corrigé)
 require('dotenv').config();
 const express = require('express');
 const axios = require('axios');
 const Joi = require('joi');
-const { parseISO, startOfDay, addDays, format, subYears } = require('date-fns');
+const { parseISO, startOfDay, addDays, format, subYears, startOfMonth, endOfMonth } = require('date-fns');
 const cors = require('cors');
 const rateLimit = require('express-rate-limit');
-
 const app = express();
 app.use(express.json());
 app.use(cors()); // Active CORS pour tous
@@ -15,12 +14,10 @@ app.use(cors()); // Active CORS pour tous
 const ENEDIS_CLIENT_ID = process.env.ENEDIS_CLIENT_ID;
 const ENEDIS_CLIENT_SECRET = process.env.ENEDIS_CLIENT_SECRET;
 const NODE_ENV = process.env.NODE_ENV || 'development';
-
 if (!ENEDIS_CLIENT_ID || !ENEDIS_CLIENT_SECRET) {
   console.error('ERREUR : Client ID/Secret manquants dans .env');
   process.exit(1);
 }
-
 const ENEDIS_BASE_URL = 'https://gw.ext.prod.api.enedis.fr';
 const TOKEN_ENDPOINT = `${ENEDIS_BASE_URL}/oauth2/v3/token`;
 
@@ -35,7 +32,6 @@ const secondLimiter = rateLimit({
   standardHeaders: true,
   legacyHeaders: false
 });
-
 const hourLimiter = rateLimit({
   windowMs: 60 * 60 * 1000,
   max: 10000,
@@ -52,7 +48,6 @@ const meteringSchema = Joi.object({
   aggregate: Joi.string().valid('hourly_monthly').optional(),
   access_token: Joi.string().optional().allow('')
 });
-
 const userInfoSchema = Joi.object({
   usage_point_id: Joi.string().pattern(/^\d{14}$/).required(),
   access_token: Joi.string().optional().allow('')
@@ -96,7 +91,6 @@ async function getToken(accessTokenProvided = null) {
 async function fetchUserInfo(req, res) {
   const { error: validationError } = userInfoSchema.validate(req.body);
   if (validationError) return res.status(400).json({ success: false, error: validationError.details[0].message });
-
   const { usage_point_id, access_token: providedToken } = req.body;
   let token;
   try {
@@ -104,7 +98,6 @@ async function fetchUserInfo(req, res) {
   } catch (error) {
     return res.status(500).json({ success: false, type: 'user_info', error: 'Erreur token' });
   }
-
   let errorOccurred = false, errorMessage = '', address = null, contract = null;
   try {
     if (NODE_ENV === 'development') console.log(`[USER_INFO] Fetch adresse/contrat pour PDL ${usage_point_id} avec ${providedToken ? 'user token' : 'app token'}`);
@@ -143,7 +136,6 @@ async function fetchUserInfo(req, res) {
     } else {
       throw new Error('Aucun usage point trouvé');
     }
-
     // 2. Contrat full (période 1 an)
     let contractResponse;
     try {
@@ -168,7 +160,6 @@ async function fetchUserInfo(req, res) {
       const contracts = contractResponse.data?.customer?.contracts || [];
       if (contracts.length > 0) contract = { ...contract, ...contracts[0] };
     }
-
     if (NODE_ENV === 'development') console.log(`[USER_INFO] OK : ${address ? 'Adresse OK' : "Pas d'adresse"}, contrat basics OK`);
   } catch (error) {
     console.error(`[USER_INFO] Erreur détaillée:`, error.response?.status, error.response?.data || error.message);
@@ -176,7 +167,6 @@ async function fetchUserInfo(req, res) {
     errorOccurred = true;
     errorMessage = error.response?.data?.error_description || error.message || `Erreur API Enedis (${error.response?.status || 'unknown'})`;
   }
-
   res.status(errorOccurred ? 500 : 200).json({
     success: !errorOccurred,
     type: 'user_info',
@@ -187,43 +177,91 @@ async function fetchUserInfo(req, res) {
   });
 }
 
+// === GET OFFICIAL MONTHLY TOTAL (générique pour conso/prod via daily_consumption/production) ===
+async function getMonthlyOfficialTotal(usage_point_id, token, providedToken, type, monthStart, monthEnd) {
+  const suffix = type === 'consumption' ? 'dc' : 'dp';
+  let effectiveToken = token;
+  try {
+    if (NODE_ENV === 'development') console.log(`[${suffix.toUpperCase()}] Fetch total officiel pour ${format(monthStart, 'yyyy-MM')} avec ${providedToken ? 'user token' : 'app token'}`);
+    let response;
+    try {
+      response = await axios.get(
+        `${ENEDIS_BASE_URL}/metering_data_${suffix}/v5/daily_${type}`,
+        {
+          headers: { 'Authorization': `Bearer ${effectiveToken}` },
+          params: {
+            usage_point_id,
+            start: format(monthStart, 'yyyy-MM-dd'),
+            end: format(monthEnd, 'yyyy-MM-dd')
+          },
+          timeout: 10000
+        }
+      );
+    } catch (authError) {
+      if (authError.response?.status === 401 || authError.response?.status === 403) {
+        console.log(`[${suffix.toUpperCase()}] Token user invalide – retry avec app token`);
+        effectiveToken = await getToken();
+        response = await axios.get(
+          `${ENEDIS_BASE_URL}/metering_data_${suffix}/v5/daily_${type}`,
+          {
+            headers: { 'Authorization': `Bearer ${effectiveToken}` },
+            params: {
+              usage_point_id,
+              start: format(monthStart, 'yyyy-MM-dd'),
+              end: format(monthEnd, 'yyyy-MM-dd')
+            },
+            timeout: 10000
+          }
+        );
+      } else {
+        throw authError;
+      }
+    }
+    // FIX : Parsing correct d'après doc : meter_reading.interval_reading
+    const values = response.data?.meter_reading?.interval_reading || [];
+    const totalWh = values.reduce((sum, entry) => sum + parseFloat(entry.value || 0), 0);
+    if (NODE_ENV === 'development') console.log(`[${suffix.toUpperCase()}] Total officiel: ${totalWh} Wh (${values.length} jours)`);
+    return totalWh;
+  } catch (error) {
+    console.error(`[${suffix.toUpperCase()}] Erreur fetch total ${format(monthStart, 'yyyy-MM')}:`, error.response?.status, error.message);
+    throw error;
+  }
+}
+
 // === AGRÉGATION (CORRIGÉE : *0.5 pour convertir W → Wh sur 30 min) ===
 function aggregateData(data) {
-    const monthlySums = {};
-    data.forEach(entry => {
-      if (!entry.date || entry.date === "null") return;
-      const dateObj = new Date(entry.date);
-      if (isNaN(dateObj.getTime())) return;
-      const monthKey = `${dateObj.getFullYear()}-${String(dateObj.getMonth() + 1).padStart(2, '0')}`;
-      const hourKey = String(dateObj.getHours()).padStart(2, '0');
-      if (!monthlySums[monthKey]) monthlySums[monthKey] = Array(24).fill(0);
-      let value = isNaN(parseFloat(entry.value)) ? 0 : parseFloat(entry.value);
-      // FIX : Multiplier par 0.5 pour énergie en Wh (intervalle 30 min = 0.5 h)
-      monthlySums[monthKey][parseInt(hourKey)] += value * 0.5;
-    });
-    Object.keys(monthlySums).forEach(month => {
-      monthlySums[month] = monthlySums[month].map(v => Math.round(v * 100) / 100);
-    });
-    return monthlySums;
-  }
+  const monthlySums = {};
+  data.forEach(entry => {
+    if (!entry.date || entry.date === "null") return;
+    const dateObj = new Date(entry.date);
+    if (isNaN(dateObj.getTime())) return;
+    const monthKey = `${dateObj.getFullYear()}-${String(dateObj.getMonth() + 1).padStart(2, '0')}`;
+    const hourKey = String(dateObj.getHours()).padStart(2, '0');
+    if (!monthlySums[monthKey]) monthlySums[monthKey] = Array(24).fill(0);
+    let value = isNaN(parseFloat(entry.value)) ? 0 : parseFloat(entry.value);
+    // FIX : Multiplier par 0.5 pour énergie en Wh (intervalle 30 min = 0.5 h)
+    monthlySums[monthKey][parseInt(hourKey)] += value * 0.5;
+  });
+  Object.keys(monthlySums).forEach(month => {
+    monthlySums[month] = monthlySums[month].map(v => Math.round(v * 100) / 100);
+  });
+  return monthlySums;
+}
 
 // === METERING GÉNÉRIQUE (optimisé : retry/skip sur 500, détection vide) ===
 async function fetchMeteringData(req, res, type, apiSuffix) {
   const { error: validationError } = meteringSchema.validate(req.body);
   if (validationError) return res.status(400).json({ success: false, error: validationError.details[0].message });
-
   const { usage_point_id, start_date, end_date, aggregate, access_token: providedToken } = req.body;
   const start = parseISO(start_date);
   const end = parseISO(end_date);
   if (start >= end) return res.status(400).json({ success: false, error: 'start_date doit être avant end_date' });
-
   let token;
   try {
     token = await getToken(providedToken);
   } catch (error) {
     return res.status(500).json({ success: false, type, error: 'Erreur token' });
   }
-
   const allData = [];
   let current = startOfDay(start);
   let errorOccurred = false, errorMessage = '';
@@ -296,11 +334,56 @@ async function fetchMeteringData(req, res, type, apiSuffix) {
     errorOccurred = true;
     errorMessage = error.response?.data?.error_description || error.message || `Erreur API (${error.response?.status || 'unknown'})`;
   }
-
   let data = allData;
+  let totalWhRaw = 0;
+  let coveragePct = 0;
+  let adjustmentInfo = {};
   if (aggregate === 'hourly_monthly' && !errorOccurred) {
     try {
       data = aggregateData(allData);
+      // Calcul couverture
+      const periodMs = end.getTime() - start.getTime();
+      const expectedIntervals = Math.floor(periodMs / (1000 * 60 * 30));  // 30 min
+      coveragePct = Math.round((allData.length / expectedIntervals) * 100);
+      totalWhRaw = allData.reduce((sum, e) => sum + (parseFloat(e.value) * 0.5), 0);
+      // === AJUSTEMENT PROPORTIONNEL VIA DAILY (pour totaux "parfaits") ===
+      if (NODE_ENV === 'development') console.log(`[AGG] Début ajustement proportionnel pour ${type}...`);
+      const months = Object.keys(data);
+      for (const monthKey of months) {
+        const [year, month] = monthKey.split('-').map(Number);
+        let monthStart = startOfMonth(new Date(year, month - 1, 1));
+        let monthEnd = endOfMonth(monthStart);
+        // Clip au période demandée si mois partiel
+        if (monthStart < start) monthStart = start;
+        if (monthEnd > end) monthEnd = end;
+        if (monthStart >= monthEnd) continue; // Mois vide
+        try {
+          const officialTotal = await getMonthlyOfficialTotal(usage_point_id, token, providedToken, type, monthStart, monthEnd);
+          const calculatedTotal = data[monthKey].reduce((sum, v) => sum + v, 0);
+          const diffPct = calculatedTotal > 0 ? Math.abs(officialTotal - calculatedTotal) / calculatedTotal * 100 : 0;
+          adjustmentInfo[monthKey] = { official: Math.round(officialTotal), calculated: Math.round(calculatedTotal), diff_pct: diffPct.toFixed(1) };
+          if (calculatedTotal > 0 && officialTotal > 0 && diffPct > 0.5) { // FIX : Seuil + official >0 pour éviter ratio 0
+            const ratio = officialTotal / calculatedTotal;
+            data[monthKey] = data[monthKey].map(v => Math.round((v * ratio) * 100) / 100);
+            adjustmentInfo[monthKey].ratio = ratio.toFixed(3);
+            adjustmentInfo[monthKey].skipped = false;
+            if (NODE_ENV === 'development') console.log(`[AGG] ${monthKey} ajusté: *${ratio.toFixed(3)} (officiel ${Math.round(officialTotal)} vs calc ${Math.round(calculatedTotal)} Wh, diff ${diffPct.toFixed(1)}%)`);
+          } else if (officialTotal === 0 && calculatedTotal > 0) {
+            adjustmentInfo[monthKey].skipped = true;
+            adjustmentInfo[monthKey].skipped_reason = "Daily vide – probable limit app token; user token requis pour ajustement";
+            if (NODE_ENV === 'development') console.log(`[AGG] Skip ajustement ${monthKey}: ${adjustmentInfo[monthKey].skipped_reason}`);
+          } else {
+            adjustmentInfo[monthKey].skipped = false;
+            if (NODE_ENV === 'development') console.log(`[AGG] ${monthKey} OK (match: ${Math.round(officialTotal)} Wh, diff ${diffPct.toFixed(1)}%)`);
+          }
+        } catch (err) {
+          adjustmentInfo[monthKey] = { error: err.message };
+          if (NODE_ENV === 'development') console.log(`[AGG] Skip ajustement ${monthKey}: ${err.message}`);
+        }
+      }
+      if (NODE_ENV === 'development') console.log(`[AGG] Ajustement terminé pour ${type}.`);
+      // Recalc total après ajustement
+      totalWhRaw = Object.values(data).reduce((sum, month) => sum + month.reduce((s, v) => s + v, 0), 0);
     } catch (err) {
       console.error('Erreur agrégation:', err);
       errorOccurred = true;
@@ -308,13 +391,15 @@ async function fetchMeteringData(req, res, type, apiSuffix) {
       data = allData;
     }
   }
-
   res.status(errorOccurred ? 500 : 200).json({
     success: !errorOccurred,
     type,
     period: { start: start_date, end: end_date },
     total_points: allData.length,
     skipped_chunks: skippedChunks,
+    coverage_pct: coveragePct,
+    total_wh: Math.round(totalWhRaw),  // Total ajusté (ou brut si skip)
+    adjustment_info: adjustmentInfo,  // Détails par mois pour debug Bubble
     data,
     error_details: errorOccurred ? errorMessage : (skippedChunks > 0 ? errorMessage : null)
   });
@@ -324,7 +409,6 @@ async function fetchMeteringData(req, res, type, apiSuffix) {
 app.post('/get-linky', secondLimiter, hourLimiter, (req, res) => fetchMeteringData(req, res, 'consumption', 'clc'));
 app.post('/get-production', secondLimiter, hourLimiter, (req, res) => fetchMeteringData(req, res, 'production', 'plc'));
 app.post('/get-user-info', secondLimiter, hourLimiter, fetchUserInfo);
-
 // Health
 app.get('/health', (req, res) => res.status(200).json({ status: 'OK', timestamp: new Date().toISOString() }));
 
