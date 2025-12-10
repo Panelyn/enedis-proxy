@@ -1,4 +1,4 @@
-// server.js - Proxy Linky Enedis pour Production PANELYN (Optimisé + Ajustement Proportionnel via daily_consumption/production + Parsing Corrigé)
+// server.js - Proxy Linky Enedis pour Production PANELYN (Optimisé + Fix User Info Nested Parse + Logs JSON Full)
 require('dotenv').config();
 const express = require('express');
 const axios = require('axios');
@@ -9,6 +9,9 @@ const rateLimit = require('express-rate-limit');
 const app = express();
 app.use(express.json());
 app.use(cors()); // Active CORS pour tous
+
+// FIX Render : Trust proxy pour X-Forwarded-For (rate-limit IP client vraie)
+app.set('trust proxy', 1);
 
 // === CONFIG ===
 const ENEDIS_CLIENT_ID = process.env.ENEDIS_CLIENT_ID;
@@ -87,95 +90,191 @@ async function getToken(accessTokenProvided = null) {
   }
 }
 
-// === FETCH USER INFO ===
+// === FETCH USER INFO (FIX : Parse Imbriqué usage_point.usage_point_addresses) ===
 async function fetchUserInfo(req, res) {
-  const { error: validationError } = userInfoSchema.validate(req.body);
-  if (validationError) return res.status(400).json({ success: false, error: validationError.details[0].message });
-  const { usage_point_id, access_token: providedToken } = req.body;
-  let token;
-  try {
-    token = await getToken(providedToken);
-  } catch (error) {
-    return res.status(500).json({ success: false, type: 'user_info', error: 'Erreur token' });
-  }
-  let errorOccurred = false, errorMessage = '', address = null, contract = null;
-  try {
-    if (NODE_ENV === 'development') console.log(`[USER_INFO] Fetch adresse/contrat pour PDL ${usage_point_id} avec ${providedToken ? 'user token' : 'app token'}`);
-    // 1. Adresse + basics contrat
-    let detailsResponse;
+    const { error: validationError } = userInfoSchema.validate(req.body);
+    if (validationError) return res.status(400).json({ success: false, error: validationError.details[0].message });
+    const { usage_point_id, access_token: providedToken } = req.body;
+    let token;
     try {
-      detailsResponse = await axios.get(
-        `${ENEDIS_BASE_URL}/metering_data/v5/usage_point_details`,
-        {
-          headers: { 'Authorization': `Bearer ${token}` },
+      token = await getToken(providedToken);
+    } catch (error) {
+      return res.status(500).json({ success: false, type: 'user_info', error: 'Erreur token' });
+    }
+    let errorOccurred = false, errorMessage = '', address = null, contract = null;
+    try {
+      if (NODE_ENV === 'development') console.log(`[USER_INFO] Fetch adresse/contrat pour PDL ${usage_point_id} avec ${providedToken ? 'user token' : 'app token'}`);
+      // Calls parallèles pour perf (Promise.allSettled)
+      const [addressResponse, contractResponse, identityResponse, contactResponse] = await Promise.allSettled([
+        // 1. Adresse (customers_upa/v5/usage_points/addresses)
+        axios.get(`${ENEDIS_BASE_URL}/customers_upa/v5/usage_points/addresses`, {
+          headers: { 'Authorization': `Bearer ${token}`, 'Accept': 'application/json' },
           params: { usage_point_id },
           timeout: 10000
-        }
-      );
-    } catch (authError) {
-      if (authError.response?.status === 401 || authError.response?.status === 403) {
-        console.log('[USER_INFO] Token user invalide – retry avec app token');
-        token = await getToken();
-        detailsResponse = await axios.get(
-          `${ENEDIS_BASE_URL}/metering_data/v5/usage_point_details`,
-          {
-            headers: { 'Authorization': `Bearer ${token}` },
-            params: { usage_point_id },
-            timeout: 10000
+        }).catch(async (authError) => {
+          if (authError.response?.status === 401 || authError.response?.status === 403) {
+            const fallbackToken = await getToken();
+            return axios.get(`${ENEDIS_BASE_URL}/customers_upa/v5/usage_points/addresses`, {
+              headers: { 'Authorization': `Bearer ${fallbackToken}`, 'Accept': 'application/json' },
+              params: { usage_point_id },
+              timeout: 10000
+            });
           }
-        );
-      } else {
-        throw authError;
-      }
-    }
-    const usagePoints = detailsResponse.data?.customer?.usage_points || [];
-    if (usagePoints.length > 0) {
-      const up = usagePoints[0];
-      address = up.address || {};
-      contract = { usage_point_id: up.usage_point_id, meter_type: up.meter_type, connection_status: up.connection_status };
-    } else {
-      throw new Error('Aucun usage point trouvé');
-    }
-    // 2. Contrat full (période 1 an)
-    let contractResponse;
-    try {
-      const contractStart = format(subYears(new Date(), 1), 'yyyy-MM-dd');
-      const contractEnd = format(new Date(), 'yyyy-MM-dd');
-      contractResponse = await axios.get(
-        `${ENEDIS_BASE_URL}/metering_data_contract_details/v5/contract_details`,
-        {
-          headers: { 'Authorization': `Bearer ${token}` },
-          params: { usage_point_id, start: contractStart, end: contractEnd },
+          throw authError;
+        }),
+        // 2. Contrat (customers_upc/v5/usage_points/contracts)
+        axios.get(`${ENEDIS_BASE_URL}/customers_upc/v5/usage_points/contracts`, {
+          headers: { 'Authorization': `Bearer ${token}`, 'Accept': 'application/json' },
+          params: { usage_point_id },
           timeout: 10000
+        }).catch(async (authError) => {
+          if (authError.response?.status === 401 || authError.response?.status === 403) {
+            const fallbackToken = await getToken();
+            return axios.get(`${ENEDIS_BASE_URL}/customers_upc/v5/usage_points/contracts`, {
+              headers: { 'Authorization': `Bearer ${fallbackToken}`, 'Accept': 'application/json' },
+              params: { usage_point_id },
+              timeout: 10000
+            });
+          }
+          throw authError;
+        }),
+        // 3. Identity (customers_i/v5/identity)
+        axios.get(`${ENEDIS_BASE_URL}/customers_i/v5/identity`, {
+          headers: { 'Authorization': `Bearer ${token}`, 'Accept': 'application/json' },
+          params: { usage_point_id },
+          timeout: 10000
+        }).catch(async (authError) => {
+          if (authError.response?.status === 401 || authError.response?.status === 403) {
+            const fallbackToken = await getToken();
+            return axios.get(`${ENEDIS_BASE_URL}/customers_i/v5/identity`, {
+              headers: { 'Authorization': `Bearer ${fallbackToken}`, 'Accept': 'application/json' },
+              params: { usage_point_id },
+              timeout: 10000
+            });
+          }
+          throw authError;
+        }),
+        // 4. Contact (customers_cd/v5/contact_data)
+        axios.get(`${ENEDIS_BASE_URL}/customers_cd/v5/contact_data`, {
+          headers: { 'Authorization': `Bearer ${token}`, 'Accept': 'application/json' },
+          params: { usage_point_id },
+          timeout: 10000
+        }).catch(async (authError) => {
+          if (authError.response?.status === 401 || authError.response?.status === 403) {
+            const fallbackToken = await getToken();
+            return axios.get(`${ENEDIS_BASE_URL}/customers_cd/v5/contact_data`, {
+              headers: { 'Authorization': `Bearer ${fallbackToken}`, 'Accept': 'application/json' },
+              params: { usage_point_id },
+              timeout: 10000
+            });
+          }
+          throw authError;
+        })
+      ]);
+  
+      // Parse Adresse (FIX : Imbriqué up.usage_point.usage_point_addresses)
+      if (addressResponse.status === 'fulfilled') {
+        const data = addressResponse.value.data;
+        if (NODE_ENV === 'development') console.log(`[USER_INFO] Adresse full response: ${JSON.stringify(data, null, 2)}`);
+        const customer = data.customer || {};
+        const innerUsagePoints = customer.usage_points || [];
+        if (NODE_ENV === 'development') console.log(`[USER_INFO] Adresse customer.usage_points length: ${innerUsagePoints.length}`);
+        if (innerUsagePoints.length > 0) {
+          const up = innerUsagePoints[0];
+          const upAddresses = up.usage_point?.usage_point_addresses || {};  // FIX : up.usage_point.usage_point_addresses
+          address = {
+            street: upAddresses.street,
+            locality: upAddresses.locality,
+            postal_code: upAddresses.postal_code,
+            insee_code: upAddresses.insee_code,
+            city: upAddresses.city,
+            country: upAddresses.country,
+            geo_points: {
+              latitude: upAddresses.geo_points?.latitude,
+              longitude: upAddresses.geo_points?.longitude,
+              altitude: upAddresses.geo_points?.altitude
+            }
+          };
+          if (NODE_ENV === 'development') console.log(`[USER_INFO] Adresse OK : ${address.street || 'N/A'}, lat ${address.geo_points?.latitude}`);
+        } else {
+          if (NODE_ENV === 'development') console.log('[USER_INFO] Pas d\'adresse trouvée (usage_points vide)');
         }
-      );
-    } catch (authError) {
-      if (authError.response?.status === 401 || authError.response?.status === 403) {
-        console.log('[USER_INFO] Token user invalide pour contrat – skip full details');
       } else {
-        throw authError;
+        if (NODE_ENV === 'development') console.log('[USER_INFO] Erreur adresse:', addressResponse.reason?.response?.status || addressResponse.reason?.message);
       }
+  
+      // Parse Contrat (FIX : up.contracts direct)
+      if (contractResponse.status === 'fulfilled') {
+        const data = contractResponse.value.data;
+        if (NODE_ENV === 'development') console.log(`[USER_INFO] Contrat full response: ${JSON.stringify(data, null, 2)}`);
+        const customer = data.customer || {};
+        const innerUsagePoints = customer.usage_points || [];
+        if (NODE_ENV === 'development') console.log(`[USER_INFO] Contrat customer.usage_points length: ${innerUsagePoints.length}`);
+        if (innerUsagePoints.length > 0) {
+          const up = innerUsagePoints[0];
+          contract = {
+            usage_point_id: up.usage_point?.usage_point_id || usage_point_id,
+            meter_type: up.usage_point?.meter_type,
+            connection_status: up.usage_point?.usage_point_status,
+            segment: up.contracts?.segment,
+            subscribed_power: up.contracts?.subscribed_power,
+            last_activation_date: up.contracts?.last_activation_date,
+            distribution_tariff: up.contracts?.distribution_tariff,
+            last_distribution_tariff_change_date: up.contracts?.last_distribution_tariff_change_date,
+            offpeak_hours: up.contracts?.offpeak_hours,
+            contract_status: up.contracts?.contract_status,
+            contract_type: up.contracts?.contract_type
+          };
+          if (NODE_ENV === 'development') console.log(`[USER_INFO] Contrat OK : segment ${contract.segment}, power ${contract.subscribed_power}`);
+        } else {
+          if (NODE_ENV === 'development') console.log('[USER_INFO] Pas de contrat trouvé (usage_points vide)');
+        }
+      } else {
+        if (NODE_ENV === 'development') console.log('[USER_INFO] Erreur contrat:', contractResponse.reason?.response?.status || contractResponse.reason?.message);
+      }
+  
+      // Parse Identity (ajoute à contract)
+      if (identityResponse.status === 'fulfilled') {
+        const identityData = identityResponse.value.data || {};
+        if (identityData.identity?.natural_person) {
+          contract = { ...contract, firstname: identityData.identity.natural_person.firstname, lastname: identityData.identity.natural_person.lastname };
+          if (NODE_ENV === 'development') console.log(`[USER_INFO] Identity OK : ${contract.firstname} ${contract.lastname}`);
+        } else {
+          if (NODE_ENV === 'development') console.log('[USER_INFO] Identity vide');
+        }
+      } else {
+        if (NODE_ENV === 'development') console.log('[USER_INFO] Skip identity:', identityResponse.reason?.response?.status || identityResponse.reason?.message);
+      }
+  
+      // Parse Contact (ajoute à contract)
+      if (contactResponse.status === 'fulfilled') {
+        const contactData = contactResponse.value.data || {};
+        if (contactData.contact_data) {
+          contract = { ...contract, email: contactData.contact_data.email, phone: contactData.contact_data.phone };
+          if (NODE_ENV === 'development') console.log(`[USER_INFO] Contact OK : ${contract.email}`);
+        } else {
+          if (NODE_ENV === 'development') console.log('[USER_INFO] Contact vide');
+        }
+      } else {
+        if (NODE_ENV === 'development') console.log('[USER_INFO] Skip contact:', contactResponse.reason?.response?.status || contactResponse.reason?.message);
+      }
+  
+      if (NODE_ENV === 'development') console.log(`[USER_INFO] Résumé : ${address ? 'Adresse OK' : "Pas d'adresse"}, contrat ${Object.keys(contract || {}).length} champs`);
+    } catch (error) {
+      console.error(`[USER_INFO] Erreur globale:`, error.response?.status, error.response?.data || error.message);
+      console.error('Full Enedis response:', JSON.stringify(error.response?.data, null, 2));
+      errorOccurred = true;
+      errorMessage = error.response?.data?.error_description || error.message || `Erreur API Enedis (${error.response?.status || 'unknown'})`;
     }
-    if (contractResponse) {
-      const contracts = contractResponse.data?.customer?.contracts || [];
-      if (contracts.length > 0) contract = { ...contract, ...contracts[0] };
-    }
-    if (NODE_ENV === 'development') console.log(`[USER_INFO] OK : ${address ? 'Adresse OK' : "Pas d'adresse"}, contrat basics OK`);
-  } catch (error) {
-    console.error(`[USER_INFO] Erreur détaillée:`, error.response?.status, error.response?.data || error.message);
-    console.error('Full Enedis response:', JSON.stringify(error.response?.data, null, 2));
-    errorOccurred = true;
-    errorMessage = error.response?.data?.error_description || error.message || `Erreur API Enedis (${error.response?.status || 'unknown'})`;
+    res.status(errorOccurred ? 500 : 200).json({
+      success: !errorOccurred,
+      type: 'user_info',
+      usage_point_id,
+      address,
+      contract,
+      error_details: errorOccurred ? errorMessage : null
+    });
   }
-  res.status(errorOccurred ? 500 : 200).json({
-    success: !errorOccurred,
-    type: 'user_info',
-    usage_point_id,
-    address,
-    contract,
-    error_details: errorOccurred ? errorMessage : null
-  });
-}
 
 // === GET OFFICIAL MONTHLY TOTAL (générique pour conso/prod via daily_consumption/production) ===
 async function getMonthlyOfficialTotal(usage_point_id, token, providedToken, type, monthStart, monthEnd) {
@@ -413,7 +512,7 @@ app.post('/get-user-info', secondLimiter, hourLimiter, fetchUserInfo);
 app.get('/health', (req, res) => res.status(200).json({ status: 'OK', timestamp: new Date().toISOString() }));
 
 // === START ===
-const PORT = process.env.PORT || 3000;
+const PORT = process.env.PORT || 3000;  // Local 3000 (Render override)
 app.listen(PORT, () => {
   console.log(`Proxy PANELYN sur http://localhost:${PORT} (env: ${NODE_ENV})`);
   console.log(`Endpoints : /get-linky, /get-production, /get-user-info, /health`);
