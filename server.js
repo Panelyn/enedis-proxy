@@ -1,4 +1,4 @@
-// server.js - VERSION AGGRÉGÉE (CUMUL DES PRM)
+// server.js - VERSION "MULTI-ROUTES" (Infos Clients + Aggrégation)
 require('dotenv').config();
 const express = require('express');
 const axios = require('axios');
@@ -25,13 +25,11 @@ const hourLimiter = rateLimit({ windowMs: 60 * 60 * 1000, max: 10000 });
 
 const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
 
-// Liste des mois fixe
 const MOIS_FR = [
   "Janvier", "Février", "Mars", "Avril", "Mai", "Juin",
   "Juillet", "Août", "Septembre", "Octobre", "Novembre", "Décembre"
 ];
 
-// Fonction pour créer une structure vide de 12 mois
 function getEmptyMonthsStructure() {
   const months = {};
   MOIS_FR.forEach(mois => {
@@ -40,7 +38,6 @@ function getEmptyMonthsStructure() {
   return months;
 }
 
-// Fonction pour additionner les données d'un mois source vers une cible
 function aggregateMonths(target, source) {
     Object.keys(source).forEach(mois => {
         if (target[mois] && source[mois]) {
@@ -51,8 +48,8 @@ function aggregateMonths(target, source) {
     });
 }
 
-// --- SCHEMA VALIDATION ---
-const getAllSchema = Joi.object({
+// --- SCHEMAS ---
+const baseSchema = Joi.object({
   usage_point_ids: Joi.array().items(Joi.string().pattern(/^\d{14}$/)).min(1).required(),
   access_token: Joi.string().optional().allow('')
 });
@@ -116,20 +113,55 @@ function isTimeInOffpeak(date, periods) {
   return false;
 }
 
-// --- RECUPERATION INFOS CLIENT ---
+// --- RECUPERATION COMPLETE INFOS CLIENT ---
 async function getUserInfoInternal(usage_point_id, providedToken) {
   const token = await getToken(providedToken);
-  let contract = null;
+  let address = null, contract = null, identity = null, contact = null;
 
   try {
-    const contRes = await axios.get(`${ENEDIS_BASE_URL}/customers_upc/v5/usage_points/contracts`, { headers: { Authorization: `Bearer ${token}` }, params: { usage_point_id }, timeout: 10000 });
-    if (contRes.data?.customer?.usage_points?.[0]) {
-      const up = contRes.data.customer.usage_points[0];
-      contract = { offpeak_hours: up.contracts?.offpeak_hours };
+    // On lance tout en parallèle pour aller vite
+    const [addrRes, contRes, idRes, contactRes] = await Promise.allSettled([
+      axios.get(`${ENEDIS_BASE_URL}/customers_upa/v5/usage_points/addresses`, { headers: { Authorization: `Bearer ${token}` }, params: { usage_point_id }, timeout: 8000 }),
+      axios.get(`${ENEDIS_BASE_URL}/customers_upc/v5/usage_points/contracts`, { headers: { Authorization: `Bearer ${token}` }, params: { usage_point_id }, timeout: 8000 }),
+      axios.get(`${ENEDIS_BASE_URL}/customers_i/v5/identity`, { headers: { Authorization: `Bearer ${token}` }, params: { usage_point_id }, timeout: 8000 }),
+      axios.get(`${ENEDIS_BASE_URL}/customers_cd/v5/contact_data`, { headers: { Authorization: `Bearer ${token}` }, params: { usage_point_id }, timeout: 8000 })
+    ]);
+
+    // 1. ADRESSE
+    if (addrRes.status === 'fulfilled') {
+      const addrData = addrRes.value.data?.customer?.usage_points?.[0]?.usage_point?.address;
+      if (addrData) address = addrData;
     }
-    return { contract };
+
+    // 2. CONTRAT (HC)
+    if (contRes.status === 'fulfilled') {
+      const up = contRes.value.data?.customer?.usage_points?.[0];
+      if (up) contract = { offpeak_hours: up.contracts?.offpeak_hours, ...up.contracts };
+    }
+
+    // 3. IDENTITÉ
+    if (idRes.status === 'fulfilled') {
+      const p = idRes.value.data?.identity?.natural_person;
+      if (p) identity = { firstname: p.firstname, lastname: p.lastname };
+    }
+
+    // 4. CONTACT (Email/Phone)
+    if (contactRes.status === 'fulfilled') {
+      const c = contactRes.value.data?.contact_data;
+      if (c) contact = { email: c.email, phone: c.phone };
+    }
+
+    return { 
+        usage_point_id,
+        address, 
+        contract, 
+        identity, 
+        contact 
+    };
+
   } catch (e) {
-    return { contract: null };
+    console.warn(`Erreur partielle Info User ${usage_point_id}: ${e.message}`);
+    return { usage_point_id, address: null, contract: null, identity: null, contact: null };
   }
 }
 
@@ -179,7 +211,6 @@ async function fetchMeteringInternal(usage_point_id, providedToken, type, apiSuf
     else monthly[monthName].hp_wh += wh;
   });
 
-  // Arrondis
   Object.keys(monthly).forEach(m => {
     monthly[m].total_wh = Math.round(monthly[m].total_wh);
     monthly[m].hp_wh = Math.round(monthly[m].hp_wh);
@@ -190,54 +221,74 @@ async function fetchMeteringInternal(usage_point_id, providedToken, type, apiSuf
   return { total_wh: total, monthly };
 }
 
-// --- ROUTE PRINCIPALE ---
+// =========================================================
+// ROUTE 1 : JUSTE LES INFOS UTILISATEURS (Pour check Email)
+// =========================================================
+app.post('/get-user-info', secondLimiter, async (req, res) => {
+    const { error } = baseSchema.validate(req.body);
+    if (error) return res.status(400).json({ success: false, error: error.details[0].message });
+  
+    const { usage_point_ids, access_token } = req.body;
+    const results = [];
+  
+    // On boucle sur chaque PRM pour récupérer ses infos
+    for (const pdl of usage_point_ids) {
+        const info = await getUserInfoInternal(pdl, access_token);
+        results.push(info);
+    }
+  
+    res.json({
+        success: true,
+        customers: results // Renvoie une liste d'objets (avec email, adresse, etc.)
+    });
+});
+
+// =========================================================
+// ROUTE 2 : TOUT (Aggrégation Conso/Prod + Liste Adresses)
+// =========================================================
 app.post('/get-all', secondLimiter, hourLimiter, async (req, res) => {
-  const { error } = getAllSchema.validate(req.body);
+  const { error } = baseSchema.validate(req.body);
   if (error) return res.status(400).json({ success: false, error: error.details[0].message });
 
   const { usage_point_ids, access_token: providedToken } = req.body;
   const startStr = format(subYears(new Date(), 1), 'yyyy-MM-dd');
   const endStr = format(new Date(), 'yyyy-MM-dd');
 
-  // --- INITIALISATION DES ACCUMULATEURS GLOBAUX ---
   const globalConso = {
-      total_wh: 0,
-      hp_wh: 0,
-      hc_wh: 0,
+      total_wh: 0, hp_wh: 0, hc_wh: 0,
       monthly: getEmptyMonthsStructure(),
-      offpeak_hours: new Set() // Pour lister toutes les plages uniques rencontrées
+      offpeak_hours: new Set() 
   };
-
   const globalProd = {
       total_wh: 0,
       monthly: getEmptyMonthsStructure()
   };
+  
+  // Liste pour stocker les infos clients détaillées
+  const customersList = [];
 
-  // --- BOUCLE SUR LES PRM ---
   for (const pdl of usage_point_ids) {
-    // 1. Infos Client & Contrat
+    // 1. Infos Client Complètes
     const userInfo = await getUserInfoInternal(pdl, providedToken);
     
+    // On ajoute à la liste des clients pour la réponse
+    customersList.push(userInfo);
+
+    // Simulation HC si besoin (pour le calcul conso)
     let offpeakStr = userInfo.contract?.offpeak_hours;
     if (!offpeakStr) {
-        offpeakStr = "HC (22H00-06H00)"; // Valeur par défaut si API contrat bloque
+        offpeakStr = "HC (22H00-06H00)";
     }
-
-    // Ajout de la plage horaire à la liste globale
     globalConso.offpeak_hours.add(offpeakStr);
 
     // 2. Consommation
     const conso = await fetchMeteringInternal(pdl, providedToken, 'consumption', 'clc', startStr, endStr, offpeakStr);
     
-    // --> AGGREGATION CONSOMMATION
     globalConso.total_wh += conso.total_wh;
-    // On recalcule les totaux HP/HC depuis les mois pour être précis
     const hp = Object.values(conso.monthly).reduce((s, m) => s + m.hp_wh, 0);
     const hc = Object.values(conso.monthly).reduce((s, m) => s + m.hc_wh, 0);
     globalConso.hp_wh += hp;
     globalConso.hc_wh += hc;
-    
-    // Fusion des mois (Janvier PRM1 + Janvier PRM2...)
     aggregateMonths(globalConso.monthly, conso.monthly);
 
     // 3. Production
@@ -250,26 +301,23 @@ app.post('/get-all', secondLimiter, hourLimiter, async (req, res) => {
     if (!prod.monthly || Object.keys(prod.monthly).length === 0) {
         prod.monthly = getEmptyMonthsStructure();
     }
-
-    // --> AGGREGATION PRODUCTION
+    
     globalProd.total_wh += prod.total_wh;
     aggregateMonths(globalProd.monthly, prod.monthly);
   }
 
-  // Conversion du Set d'heures creuses en tableau pour le JSON
-  const allOffpeakHours = Array.from(globalConso.offpeak_hours);
-
-  // Construction de la réponse simplifiée
   res.json({
     success: true,
     period: { start: startStr, end: endStr },
-    // On renvoie directement l'objet global
+    // On renvoie la liste des adresses/emails
+    customers_list: customersList,
+    // Et les données globales cumulées
     global_data: {
         consumption: {
             total_wh: globalConso.total_wh,
             hp_wh: globalConso.hp_wh,
             hc_wh: globalConso.hc_wh,
-            offpeak_hours_detected: allOffpeakHours,
+            offpeak_hours_detected: Array.from(globalConso.offpeak_hours),
             monthly: globalConso.monthly
         },
         production: {
