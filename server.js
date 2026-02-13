@@ -1,4 +1,4 @@
-// server.js - VERSION "MULTI-ROUTES" (Infos Clients + Aggrégation)
+// server.js - VERSION FINALE BUBBLE READY
 require('dotenv').config();
 const express = require('express');
 const axios = require('axios');
@@ -20,9 +20,11 @@ const TOKEN_ENDPOINT = `${ENEDIS_BASE_URL}/oauth2/v3/token`;
 
 let appTokenCache = { token: null, expiresAt: 0 };
 
+// Rate Limiters
 const secondLimiter = rateLimit({ windowMs: 1000, max: 10 });
 const hourLimiter = rateLimit({ windowMs: 60 * 60 * 1000, max: 10000 });
 
+// Utilitaire pour attendre
 const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
 
 const MOIS_FR = [
@@ -113,13 +115,17 @@ function isTimeInOffpeak(date, periods) {
   return false;
 }
 
-// --- RECUPERATION COMPLETE INFOS CLIENT ---
+// --- RECUPERATION COMPLETE INFOS CLIENT (FORMAT BUBBLE) ---
 async function getUserInfoInternal(usage_point_id, providedToken) {
   const token = await getToken(providedToken);
-  let address = null, contract = null, identity = null, contact = null;
+  
+  // Initialisation FORCEE avec null pour que Bubble détecte les clés
+  let address = { street: null, postal_code: null, city: null, country: null };
+  let contract = { offpeak_hours: null, subscribed_power: null };
+  let identity = { firstname: null, lastname: null };
+  let contact = { email: null, phone: null };
 
   try {
-    // On lance tout en parallèle pour aller vite
     const [addrRes, contRes, idRes, contactRes] = await Promise.allSettled([
       axios.get(`${ENEDIS_BASE_URL}/customers_upa/v5/usage_points/addresses`, { headers: { Authorization: `Bearer ${token}` }, params: { usage_point_id }, timeout: 8000 }),
       axios.get(`${ENEDIS_BASE_URL}/customers_upc/v5/usage_points/contracts`, { headers: { Authorization: `Bearer ${token}` }, params: { usage_point_id }, timeout: 8000 }),
@@ -127,42 +133,53 @@ async function getUserInfoInternal(usage_point_id, providedToken) {
       axios.get(`${ENEDIS_BASE_URL}/customers_cd/v5/contact_data`, { headers: { Authorization: `Bearer ${token}` }, params: { usage_point_id }, timeout: 8000 })
     ]);
 
-    // 1. ADRESSE
+    // Remplissage des objets si succès
     if (addrRes.status === 'fulfilled') {
-      const addrData = addrRes.value.data?.customer?.usage_points?.[0]?.usage_point?.address;
-      if (addrData) address = addrData;
+      const d = addrRes.value.data?.customer?.usage_points?.[0]?.usage_point?.address;
+      if (d) {
+        address.street = d.street || null;
+        address.postal_code = d.postal_code || null;
+        address.city = d.city || null;
+        address.country = d.country || null;
+      }
     }
 
-    // 2. CONTRAT (HC)
     if (contRes.status === 'fulfilled') {
       const up = contRes.value.data?.customer?.usage_points?.[0];
-      if (up) contract = { offpeak_hours: up.contracts?.offpeak_hours, ...up.contracts };
+      if (up && up.contracts) {
+        contract.offpeak_hours = up.contracts.offpeak_hours || null;
+        contract.subscribed_power = up.contracts.subscribed_power || null;
+      }
     }
 
-    // 3. IDENTITÉ
     if (idRes.status === 'fulfilled') {
       const p = idRes.value.data?.identity?.natural_person;
-      if (p) identity = { firstname: p.firstname, lastname: p.lastname };
+      if (p) {
+        identity.firstname = p.firstname || null;
+        identity.lastname = p.lastname || null;
+      }
     }
 
-    // 4. CONTACT (Email/Phone)
     if (contactRes.status === 'fulfilled') {
       const c = contactRes.value.data?.contact_data;
-      if (c) contact = { email: c.email, phone: c.phone };
+      if (c) {
+        contact.email = c.email || null;
+        contact.phone = c.phone || null;
+      }
     }
 
-    return { 
-        usage_point_id,
-        address, 
-        contract, 
-        identity, 
-        contact 
-    };
-
   } catch (e) {
-    console.warn(`Erreur partielle Info User ${usage_point_id}: ${e.message}`);
-    return { usage_point_id, address: null, contract: null, identity: null, contact: null };
+    // En cas d'erreur, on garde les objets initialisés à null
+    console.warn(`Info User partielle ou échouée pour ${usage_point_id}: ${e.message}`);
   }
+
+  return { 
+      usage_point_id,
+      address, 
+      contract, 
+      identity, 
+      contact 
+  };
 }
 
 // --- RECUPERATION COURBES ---
@@ -222,7 +239,7 @@ async function fetchMeteringInternal(usage_point_id, providedToken, type, apiSuf
 }
 
 // =========================================================
-// ROUTE 1 : JUSTE LES INFOS UTILISATEURS (Pour check Email)
+// ROUTE 1 : JUSTE LES INFOS UTILISATEURS (Bubble Email Check)
 // =========================================================
 app.post('/get-user-info', secondLimiter, async (req, res) => {
     const { error } = baseSchema.validate(req.body);
@@ -231,7 +248,6 @@ app.post('/get-user-info', secondLimiter, async (req, res) => {
     const { usage_point_ids, access_token } = req.body;
     const results = [];
   
-    // On boucle sur chaque PRM pour récupérer ses infos
     for (const pdl of usage_point_ids) {
         const info = await getUserInfoInternal(pdl, access_token);
         results.push(info);
@@ -239,7 +255,7 @@ app.post('/get-user-info', secondLimiter, async (req, res) => {
   
     res.json({
         success: true,
-        customers: results // Renvoie une liste d'objets (avec email, adresse, etc.)
+        customers: results
     });
 });
 
@@ -264,24 +280,21 @@ app.post('/get-all', secondLimiter, hourLimiter, async (req, res) => {
       monthly: getEmptyMonthsStructure()
   };
   
-  // Liste pour stocker les infos clients détaillées
   const customersList = [];
 
   for (const pdl of usage_point_ids) {
-    // 1. Infos Client Complètes
+    // 1. Infos Client
     const userInfo = await getUserInfoInternal(pdl, providedToken);
-    
-    // On ajoute à la liste des clients pour la réponse
     customersList.push(userInfo);
 
-    // Simulation HC si besoin (pour le calcul conso)
+    // 2. Simulation HC si manquantes
     let offpeakStr = userInfo.contract?.offpeak_hours;
     if (!offpeakStr) {
         offpeakStr = "HC (22H00-06H00)";
     }
     globalConso.offpeak_hours.add(offpeakStr);
 
-    // 2. Consommation
+    // 3. Consommation
     const conso = await fetchMeteringInternal(pdl, providedToken, 'consumption', 'clc', startStr, endStr, offpeakStr);
     
     globalConso.total_wh += conso.total_wh;
@@ -291,7 +304,7 @@ app.post('/get-all', secondLimiter, hourLimiter, async (req, res) => {
     globalConso.hc_wh += hc;
     aggregateMonths(globalConso.monthly, conso.monthly);
 
-    // 3. Production
+    // 4. Production
     let prod;
     try {
         prod = await fetchMeteringInternal(pdl, providedToken, 'production', 'plc', startStr, endStr, '');
@@ -309,9 +322,7 @@ app.post('/get-all', secondLimiter, hourLimiter, async (req, res) => {
   res.json({
     success: true,
     period: { start: startStr, end: endStr },
-    // On renvoie la liste des adresses/emails
     customers_list: customersList,
-    // Et les données globales cumulées
     global_data: {
         consumption: {
             total_wh: globalConso.total_wh,
