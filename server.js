@@ -1,4 +1,4 @@
-// server.js - VERSION FINALE BUBBLE READY
+// server.js - VERSION FINALE (Listes ordonnées Jan-Dec + kWh)
 require('dotenv').config();
 const express = require('express');
 const axios = require('axios');
@@ -27,6 +27,7 @@ const hourLimiter = rateLimit({ windowMs: 60 * 60 * 1000, max: 10000 });
 // Utilitaire pour attendre
 const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
 
+// ORDRE STRICT DES MOIS
 const MOIS_FR = [
   "Janvier", "Février", "Mars", "Avril", "Mai", "Juin",
   "Juillet", "Août", "Septembre", "Octobre", "Novembre", "Décembre"
@@ -35,7 +36,7 @@ const MOIS_FR = [
 function getEmptyMonthsStructure() {
   const months = {};
   MOIS_FR.forEach(mois => {
-    months[mois] = { total_wh: 0, hp_wh: 0, hc_wh: 0 };
+    months[mois] = { total_kwh: 0, hp_kwh: 0, hc_kwh: 0 };
   });
   return months;
 }
@@ -43,9 +44,9 @@ function getEmptyMonthsStructure() {
 function aggregateMonths(target, source) {
     Object.keys(source).forEach(mois => {
         if (target[mois] && source[mois]) {
-            target[mois].total_wh += source[mois].total_wh;
-            target[mois].hp_wh += source[mois].hp_wh;
-            target[mois].hc_wh += source[mois].hc_wh;
+            target[mois].total_kwh += source[mois].total_kwh;
+            target[mois].hp_kwh += source[mois].hp_kwh;
+            target[mois].hc_kwh += source[mois].hc_kwh;
         }
     });
 }
@@ -115,11 +116,9 @@ function isTimeInOffpeak(date, periods) {
   return false;
 }
 
-// --- RECUPERATION COMPLETE INFOS CLIENT (FORMAT BUBBLE) ---
+// --- RECUPERATION COMPLETE INFOS CLIENT ---
 async function getUserInfoInternal(usage_point_id, providedToken) {
   const token = await getToken(providedToken);
-  
-  // Initialisation FORCEE avec null pour que Bubble détecte les clés
   let address = { street: null, postal_code: null, city: null, country: null };
   let contract = { offpeak_hours: null, subscribed_power: null };
   let identity = { firstname: null, lastname: null };
@@ -133,7 +132,6 @@ async function getUserInfoInternal(usage_point_id, providedToken) {
       axios.get(`${ENEDIS_BASE_URL}/customers_cd/v5/contact_data`, { headers: { Authorization: `Bearer ${token}` }, params: { usage_point_id }, timeout: 8000 })
     ]);
 
-    // Remplissage des objets si succès
     if (addrRes.status === 'fulfilled') {
       const d = addrRes.value.data?.customer?.usage_points?.[0]?.usage_point?.address;
       if (d) {
@@ -143,7 +141,6 @@ async function getUserInfoInternal(usage_point_id, providedToken) {
         address.country = d.country || null;
       }
     }
-
     if (contRes.status === 'fulfilled') {
       const up = contRes.value.data?.customer?.usage_points?.[0];
       if (up && up.contracts) {
@@ -151,7 +148,6 @@ async function getUserInfoInternal(usage_point_id, providedToken) {
         contract.subscribed_power = up.contracts.subscribed_power || null;
       }
     }
-
     if (idRes.status === 'fulfilled') {
       const p = idRes.value.data?.identity?.natural_person;
       if (p) {
@@ -159,7 +155,6 @@ async function getUserInfoInternal(usage_point_id, providedToken) {
         identity.lastname = p.lastname || null;
       }
     }
-
     if (contactRes.status === 'fulfilled') {
       const c = contactRes.value.data?.contact_data;
       if (c) {
@@ -167,22 +162,14 @@ async function getUserInfoInternal(usage_point_id, providedToken) {
         contact.phone = c.phone || null;
       }
     }
-
   } catch (e) {
-    // En cas d'erreur, on garde les objets initialisés à null
     console.warn(`Info User partielle ou échouée pour ${usage_point_id}: ${e.message}`);
   }
 
-  return { 
-      usage_point_id,
-      address, 
-      contract, 
-      identity, 
-      contact 
-  };
+  return { usage_point_id, address, contract, identity, contact };
 }
 
-// --- RECUPERATION COURBES ---
+// --- RECUPERATION COURBES (EN KWH) ---
 async function fetchMeteringInternal(usage_point_id, providedToken, type, apiSuffix, startStr, endStr, offpeakStr) {
   const token = await getToken(providedToken);
   const allData = [];
@@ -221,25 +208,32 @@ async function fetchMeteringInternal(usage_point_id, providedToken, type, apiSuf
     const monthIndex = date.getMonth(); 
     const monthName = MOIS_FR[monthIndex];
     
-    const wh = parseFloat(entry.value) * 0.5;
+    // --- CONVERSION WH -> KWH (Division par 1000) ---
+    // Note: pas de 30 min (0.5) = énergie = puissance moyenne * temps ?
+    // L'API renvoie des Watts moyens sur 30min ou de l'énergie ?
+    // Enedis V5 Load Curve renvoie des Watts. Donc Energie (Wh) = Watts * 0.5h.
+    // Ensuite on divise par 1000 pour avoir des kWh.
     
-    monthly[monthName].total_wh += wh;
-    if (isTimeInOffpeak(date, periods)) monthly[monthName].hc_wh += wh;
-    else monthly[monthName].hp_wh += wh;
+    const kwh = (parseFloat(entry.value) * 0.5) / 1000;
+    
+    monthly[monthName].total_kwh += kwh;
+    if (isTimeInOffpeak(date, periods)) monthly[monthName].hc_kwh += kwh;
+    else monthly[monthName].hp_kwh += kwh;
   });
 
+  // Arrondis à 2 décimales pour être propre en kWh
   Object.keys(monthly).forEach(m => {
-    monthly[m].total_wh = Math.round(monthly[m].total_wh);
-    monthly[m].hp_wh = Math.round(monthly[m].hp_wh);
-    monthly[m].hc_wh = Math.round(monthly[m].hc_wh);
+    monthly[m].total_kwh = Number(monthly[m].total_kwh.toFixed(2));
+    monthly[m].hp_kwh = Number(monthly[m].hp_kwh.toFixed(2));
+    monthly[m].hc_kwh = Number(monthly[m].hc_kwh.toFixed(2));
   });
 
-  const total = Math.round(Object.values(monthly).reduce((s, m) => s + m.total_wh, 0));
-  return { total_wh: total, monthly };
+  const total = Number(Object.values(monthly).reduce((s, m) => s + m.total_kwh, 0).toFixed(2));
+  return { total_kwh: total, monthly };
 }
 
 // =========================================================
-// ROUTE 1 : JUSTE LES INFOS UTILISATEURS (Bubble Email Check)
+// ROUTE 1 : GET USER INFO (Inchangée)
 // =========================================================
 app.post('/get-user-info', secondLimiter, async (req, res) => {
     const { error } = baseSchema.validate(req.body);
@@ -260,7 +254,7 @@ app.post('/get-user-info', secondLimiter, async (req, res) => {
 });
 
 // =========================================================
-// ROUTE 2 : TOUT (Aggrégation Conso/Prod + Liste Adresses)
+// ROUTE 2 : GET ALL (Nouvelle structure LISTES en kWh)
 // =========================================================
 app.post('/get-all', secondLimiter, hourLimiter, async (req, res) => {
   const { error } = baseSchema.validate(req.body);
@@ -270,71 +264,64 @@ app.post('/get-all', secondLimiter, hourLimiter, async (req, res) => {
   const startStr = format(subYears(new Date(), 1), 'yyyy-MM-dd');
   const endStr = format(new Date(), 'yyyy-MM-dd');
 
-  const globalConso = {
-      total_wh: 0, hp_wh: 0, hc_wh: 0,
-      monthly: getEmptyMonthsStructure(),
-      offpeak_hours: new Set() 
-  };
-  const globalProd = {
-      total_wh: 0,
-      monthly: getEmptyMonthsStructure()
-  };
+  // Accumulateurs
+  const globalConso = { monthly: getEmptyMonthsStructure(), offpeak_hours: new Set() };
+  const globalProd = { monthly: getEmptyMonthsStructure() };
   
   const customersList = [];
 
   for (const pdl of usage_point_ids) {
-    // 1. Infos Client
     const userInfo = await getUserInfoInternal(pdl, providedToken);
     customersList.push(userInfo);
 
-    // 2. Simulation HC si manquantes
     let offpeakStr = userInfo.contract?.offpeak_hours;
-    if (!offpeakStr) {
-        offpeakStr = "HC (22H00-06H00)";
-    }
+    if (!offpeakStr) offpeakStr = "HC (22H00-06H00)";
     globalConso.offpeak_hours.add(offpeakStr);
 
-    // 3. Consommation
     const conso = await fetchMeteringInternal(pdl, providedToken, 'consumption', 'clc', startStr, endStr, offpeakStr);
-    
-    globalConso.total_wh += conso.total_wh;
-    const hp = Object.values(conso.monthly).reduce((s, m) => s + m.hp_wh, 0);
-    const hc = Object.values(conso.monthly).reduce((s, m) => s + m.hc_wh, 0);
-    globalConso.hp_wh += hp;
-    globalConso.hc_wh += hc;
     aggregateMonths(globalConso.monthly, conso.monthly);
 
-    // 4. Production
     let prod;
     try {
         prod = await fetchMeteringInternal(pdl, providedToken, 'production', 'plc', startStr, endStr, '');
     } catch (e) {
-        prod = { total_wh: 0, monthly: getEmptyMonthsStructure() };
+        prod = { total_kwh: 0, monthly: getEmptyMonthsStructure() };
     }
     if (!prod.monthly || Object.keys(prod.monthly).length === 0) {
         prod.monthly = getEmptyMonthsStructure();
     }
-    
-    globalProd.total_wh += prod.total_wh;
     aggregateMonths(globalProd.monthly, prod.monthly);
   }
+
+  // --- TRANSFORMATION EN LISTES ORDONNÉES (JAN -> DEC) ---
+  // On mappe le tableau fixe MOIS_FR pour garantir l'ordre
+  const consoHpList = MOIS_FR.map(mois => Number(globalConso.monthly[mois].hp_kwh.toFixed(2)));
+  const consoHcList = MOIS_FR.map(mois => Number(globalConso.monthly[mois].hc_kwh.toFixed(2)));
+  const prodList = MOIS_FR.map(mois => Number(globalProd.monthly[mois].total_kwh.toFixed(2)));
+
+  // Calcul des totaux globaux (somme des listes)
+  const totalHp = Number(consoHpList.reduce((a, b) => a + b, 0).toFixed(2));
+  const totalHc = Number(consoHcList.reduce((a, b) => a + b, 0).toFixed(2));
+  const totalProd = Number(prodList.reduce((a, b) => a + b, 0).toFixed(2));
 
   res.json({
     success: true,
     period: { start: startStr, end: endStr },
     customers_list: customersList,
     global_data: {
-        consumption: {
-            total_wh: globalConso.total_wh,
-            hp_wh: globalConso.hp_wh,
-            hc_wh: globalConso.hc_wh,
-            offpeak_hours_detected: Array.from(globalConso.offpeak_hours),
-            monthly: globalConso.monthly
+        totals_kwh: {
+            consumption: Number((totalHp + totalHc).toFixed(2)),
+            production: totalProd,
+            hp: totalHp,
+            hc: totalHc
         },
-        production: {
-            total_wh: globalProd.total_wh,
-            monthly: globalProd.monthly
-        }
+        lists_kwh: {
+            // Ces listes contiennent toujours 12 valeurs, de Janvier (index 0) à Décembre (index 11)
+            consumption_hp: consoHpList,
+            consumption_hc: consoHcList,
+            production: prodList
+        },
+        offpeak_hours_detected: Array.from(globalConso.offpeak_hours)
     }
   });
 });
