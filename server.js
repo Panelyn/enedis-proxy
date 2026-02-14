@@ -1,4 +1,4 @@
-// server.js - VERSION FINALE (parsing ultra-robuste + debug + callback)
+// server.js - VERSION FINALE + DEBUG (copie-colle tout)
 require('dotenv').config();
 const express = require('express');
 const axios = require('axios');
@@ -77,7 +77,7 @@ function isTimeInOffpeak(date, periods) {
   return false;
 }
 
-// === USER INFO - PARSING ROBUSTE ===
+// === USER INFO - VERSION DEBUG ===
 async function getUserInfoInternal(usage_point_id, providedToken) {
   const token = await getToken(providedToken);
   let address = { street: null, postal_code: null, city: null };
@@ -93,7 +93,23 @@ async function getUserInfoInternal(usage_point_id, providedToken) {
       axios.get(`${ENEDIS_BASE_URL}/customers_cd/v5/contact_data`, { headers: { Authorization: `Bearer ${token}` }, params: { usage_point_id }, timeout: 10000 })
     ]);
 
-    // === ADRESSE ===
+    // === DEBUG CONTRACT (le plus important) ===
+    if (contRes.status === 'fulfilled') {
+      const data = contRes.value.data;
+      console.log(`RAW CONTRACT RESPONSE for ${usage_point_id}:`, JSON.stringify(data, null, 2));
+      
+      const up = data.customer?.usage_points?.[0];
+      const contracts = up?.contracts || up?.usage_point?.contracts;
+      if (contracts) {
+        contract.offpeak_hours = contracts.offpeak_hours;
+        contract.subscribed_power = contracts.subscribed_power;
+        console.log(`✅ OFFPEAK HOURS TROUVÉ : ${contracts.offpeak_hours}`);
+      } else {
+        console.log('⚠️ Pas de "contracts" trouvé dans la réponse');
+      }
+    }
+
+    // Adresse
     if (addrRes.status === 'fulfilled') {
       const data = addrRes.value.data;
       const up = data.customer?.usage_points?.[0];
@@ -101,28 +117,13 @@ async function getUserInfoInternal(usage_point_id, providedToken) {
       if (addr) address = { street: addr.street, postal_code: addr.postal_code, city: addr.city };
     }
 
-    // === CONTRAT (le plus important) ===
-    if (contRes.status === 'fulfilled') {
-      const data = contRes.value.data;
-      const up = data.customer?.usage_points?.[0];
-      const contracts = up?.contracts || up?.usage_point?.contracts;
-      if (contracts) {
-        contract = {
-          offpeak_hours: contracts.offpeak_hours,
-          subscribed_power: contracts.subscribed_power,
-          ...contracts
-        };
-        console.log(`✅ OFFPEAK HOURS TROUVÉ : ${contracts.offpeak_hours}`);
-      }
-    }
-
-    // === IDENTITÉ ===
+    // Identité
     if (idRes.status === 'fulfilled') {
       const p = idRes.value.data?.identity?.natural_person;
       if (p) identity = { firstname: p.firstname, lastname: p.lastname };
     }
 
-    // === CONTACT ===
+    // Contact
     if (contactRes.status === 'fulfilled') {
       const c = contactRes.value.data?.contact_data;
       if (c) contact = { email: c.email, phone: c.phone };
@@ -184,7 +185,7 @@ async function fetchMeteringInternal(usage_point_id, providedToken, type, apiSuf
   return { total_kwh: total, monthly };
 }
 
-// ====================== CALLBACK ======================
+// CALLBACK
 app.get('/callback', (req, res) => {
   const { code, state, usage_point_id, error } = req.query;
   console.log('╔════════════════════════════════════════════╗');
@@ -200,7 +201,7 @@ app.get('/callback', (req, res) => {
   res.redirect(`https://panelyn.com/simulateur?consentement=ok&usage_point_id=${usage_point_id || ''}`);
 });
 
-// ====================== GET-ALL ======================
+// GET-ALL
 app.post('/get-all', secondLimiter, hourLimiter, async (req, res) => {
   const { error } = baseSchema.validate(req.body);
   if (error) return res.status(400).json({ success: false, error: error.details[0].message });
