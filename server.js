@@ -1,4 +1,4 @@
-// server.js - VERSION FINALE + LOGS COMPLETS INFO CLIENT
+// server.js - VERSION FINALE (FIX ERROR 406 + LOGS)
 require('dotenv').config();
 const express = require('express');
 const axios = require('axios');
@@ -45,13 +45,18 @@ async function getToken(providedToken = null) {
   const now = Date.now();
   if (appTokenCache.token && now < appTokenCache.expiresAt) return appTokenCache.token;
 
-  const response = await axios.post(TOKEN_ENDPOINT,
-    new URLSearchParams({ grant_type: 'client_credentials', client_id: ENEDIS_CLIENT_ID, client_secret: ENEDIS_CLIENT_SECRET, scope: 'metering_data metering_data_contract_details' }),
-    { headers: { 'Content-Type': 'application/x-www-form-urlencoded' }, timeout: 10000 }
-  );
-  appTokenCache.token = response.data.access_token;
-  appTokenCache.expiresAt = now + (response.data.expires_in - 300) * 1000;
-  return appTokenCache.token;
+  try {
+    const response = await axios.post(TOKEN_ENDPOINT,
+      new URLSearchParams({ grant_type: 'client_credentials', client_id: ENEDIS_CLIENT_ID, client_secret: ENEDIS_CLIENT_SECRET, scope: 'metering_data metering_data_contract_details' }),
+      { headers: { 'Content-Type': 'application/x-www-form-urlencoded' }, timeout: 10000 }
+    );
+    appTokenCache.token = response.data.access_token;
+    appTokenCache.expiresAt = now + (response.data.expires_in - 300) * 1000;
+    return appTokenCache.token;
+  } catch (error) {
+    console.error("Erreur récupération token app:", error.message);
+    throw new Error("Impossible d'obtenir un token Enedis");
+  }
 }
 
 // HEURES CREUSES
@@ -77,7 +82,7 @@ function isTimeInOffpeak(date, periods) {
   return false;
 }
 
-// === USER INFO - VERSION LOGS COMPLETS ===
+// === USER INFO (FIX 406: Ajout Header Accept) ===
 async function getUserInfoInternal(usage_point_id, providedToken) {
   const token = await getToken(providedToken);
   let address = { street: null, postal_code: null, city: null };
@@ -85,19 +90,28 @@ async function getUserInfoInternal(usage_point_id, providedToken) {
   let identity = { firstname: null, lastname: null };
   let contact = { email: null, phone: null };
 
+  // HEADER OBLIGATOIRE POUR ENEDIS INFO CLIENT
+  const config = { 
+    headers: { 
+        'Authorization': `Bearer ${token}`,
+        'Accept': 'application/json' // <--- LE FIX EST ICI
+    }, 
+    params: { usage_point_id }, 
+    timeout: 10000 
+  };
+
   try {
     const [addrRes, contRes, idRes, contactRes] = await Promise.allSettled([
-      axios.get(`${ENEDIS_BASE_URL}/customers_upa/v5/usage_points/addresses`, { headers: { Authorization: `Bearer ${token}` }, params: { usage_point_id }, timeout: 10000 }),
-      axios.get(`${ENEDIS_BASE_URL}/customers_upc/v5/usage_points/contracts`, { headers: { Authorization: `Bearer ${token}` }, params: { usage_point_id }, timeout: 10000 }),
-      axios.get(`${ENEDIS_BASE_URL}/customers_i/v5/identity`, { headers: { Authorization: `Bearer ${token}` }, params: { usage_point_id }, timeout: 10000 }),
-      axios.get(`${ENEDIS_BASE_URL}/customers_cd/v5/contact_data`, { headers: { Authorization: `Bearer ${token}` }, params: { usage_point_id }, timeout: 10000 })
+      axios.get(`${ENEDIS_BASE_URL}/customers_upa/v5/usage_points/addresses`, config),
+      axios.get(`${ENEDIS_BASE_URL}/customers_upc/v5/usage_points/contracts`, config),
+      axios.get(`${ENEDIS_BASE_URL}/customers_i/v5/identity`, config),
+      axios.get(`${ENEDIS_BASE_URL}/customers_cd/v5/contact_data`, config)
     ]);
 
     // 1. DEBUG CONTRAT
     if (contRes.status === 'fulfilled') {
       const data = contRes.value.data;
-      console.log(`\n🔵 [DEBUG] RAW CONTRACT RESPONSE (${usage_point_id}):\n`, JSON.stringify(data, null, 2));
-      
+      console.log(`\n🔵 [DEBUG] RAW CONTRACT (${usage_point_id}): OK`);
       const up = data.customer?.usage_points?.[0];
       const contracts = up?.contracts || up?.usage_point?.contracts;
       if (contracts) {
@@ -111,39 +125,25 @@ async function getUserInfoInternal(usage_point_id, providedToken) {
     // 2. DEBUG ADRESSE
     if (addrRes.status === 'fulfilled') {
       const data = addrRes.value.data;
-      console.log(`\n🔵 [DEBUG] RAW ADDRESS RESPONSE (${usage_point_id}):\n`, JSON.stringify(data, null, 2));
-
       const up = data.customer?.usage_points?.[0];
       const addr = up?.usage_point?.usage_point_addresses || up?.address;
       if (addr) address = { street: addr.street, postal_code: addr.postal_code, city: addr.city };
-    } else {
-      console.log(`🔴 [DEBUG] ADDRESS FAILED:`, addrRes.reason?.message);
     }
 
     // 3. DEBUG IDENTITÉ
     if (idRes.status === 'fulfilled') {
       const data = idRes.value.data;
-      console.log(`\n🔵 [DEBUG] RAW IDENTITY RESPONSE (${usage_point_id}):\n`, JSON.stringify(data, null, 2));
-
       const p = data?.identity?.natural_person;
       if (p) identity = { firstname: p.firstname, lastname: p.lastname };
-    } else {
-      console.log(`🔴 [DEBUG] IDENTITY FAILED:`, idRes.reason?.message);
     }
 
     // 4. DEBUG CONTACT
     if (contactRes.status === 'fulfilled') {
       const data = contactRes.value.data;
-      console.log(`\n🔵 [DEBUG] RAW CONTACT RESPONSE (${usage_point_id}):\n`, JSON.stringify(data, null, 2));
-
       const c = data?.contact_data;
       if (c) contact = { email: c.email, phone: c.phone };
-    } else {
-      console.log(`🔴 [DEBUG] CONTACT FAILED:`, contactRes.reason?.message);
     }
     
-    console.log('--------------------------------------------------\n');
-
   } catch (e) {
     console.error(`Erreur UserInfo ${usage_point_id}:`, e.message);
   }
@@ -167,7 +167,7 @@ async function fetchMeteringInternal(usage_point_id, providedToken, type, apiSuf
     try {
       await sleep(150);
       const res = await axios.get(`${ENEDIS_BASE_URL}/metering_data_${apiSuffix}/v5/${type}_load_curve`, {
-        headers: { Authorization: `Bearer ${token}` },
+        headers: { Authorization: `Bearer ${token}` }, // Metering n'a pas besoin de Accept: application/json strict
         params: { usage_point_id, start: chunkStart, end: chunkEnd },
         timeout: 15000
       });
@@ -204,15 +204,6 @@ async function fetchMeteringInternal(usage_point_id, providedToken, type, apiSuf
 // CALLBACK
 app.get('/callback', (req, res) => {
   const { code, state, usage_point_id, error } = req.query;
-  console.log('╔════════════════════════════════════════════╗');
-  console.log('║   ✅ CONSENTEMENT ENEDIS REÇU            ║');
-  console.log('╠════════════════════════════════════════════╣');
-  console.log('║ PRM          →', usage_point_id);
-  console.log('║ Code         →', code);
-  console.log('║ State        →', state);
-  console.log('║ Error        →', error);
-  console.log('╚════════════════════════════════════════════╝');
-
   if (error) return res.redirect(`https://panelyn.com/simulateur?error=${error}`);
   res.redirect(`https://panelyn.com/simulateur?consentement=ok&usage_point_id=${usage_point_id || ''}`);
 });
@@ -272,6 +263,22 @@ app.post('/get-all', secondLimiter, hourLimiter, async (req, res) => {
       }
     }
   });
+});
+
+// GET USER INFO (Route Bubble)
+app.post('/get-user-info', secondLimiter, async (req, res) => {
+    const { error } = baseSchema.validate(req.body);
+    if (error) return res.status(400).json({ success: false, error: error.details[0].message });
+  
+    const { usage_point_ids, access_token } = req.body;
+    const results = [];
+  
+    for (const pdl of usage_point_ids) {
+        const info = await getUserInfoInternal(pdl, access_token);
+        results.push(info);
+    }
+  
+    res.json({ success: true, customers: results });
 });
 
 app.get('/health', (req, res) => res.json({ status: 'OK' }));
