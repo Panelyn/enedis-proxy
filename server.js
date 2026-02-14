@@ -1,4 +1,4 @@
-// server.js - VERSION FINALE + DEBUG (copie-colle tout)
+// server.js - VERSION FINALE + LOGS COMPLETS INFO CLIENT
 require('dotenv').config();
 const express = require('express');
 const axios = require('axios');
@@ -77,7 +77,7 @@ function isTimeInOffpeak(date, periods) {
   return false;
 }
 
-// === USER INFO - VERSION DEBUG ===
+// === USER INFO - VERSION LOGS COMPLETS ===
 async function getUserInfoInternal(usage_point_id, providedToken) {
   const token = await getToken(providedToken);
   let address = { street: null, postal_code: null, city: null };
@@ -93,41 +93,57 @@ async function getUserInfoInternal(usage_point_id, providedToken) {
       axios.get(`${ENEDIS_BASE_URL}/customers_cd/v5/contact_data`, { headers: { Authorization: `Bearer ${token}` }, params: { usage_point_id }, timeout: 10000 })
     ]);
 
-    // === DEBUG CONTRACT (le plus important) ===
+    // 1. DEBUG CONTRAT
     if (contRes.status === 'fulfilled') {
       const data = contRes.value.data;
-      console.log(`RAW CONTRACT RESPONSE for ${usage_point_id}:`, JSON.stringify(data, null, 2));
+      console.log(`\n🔵 [DEBUG] RAW CONTRACT RESPONSE (${usage_point_id}):\n`, JSON.stringify(data, null, 2));
       
       const up = data.customer?.usage_points?.[0];
       const contracts = up?.contracts || up?.usage_point?.contracts;
       if (contracts) {
         contract.offpeak_hours = contracts.offpeak_hours;
         contract.subscribed_power = contracts.subscribed_power;
-        console.log(`✅ OFFPEAK HOURS TROUVÉ : ${contracts.offpeak_hours}`);
-      } else {
-        console.log('⚠️ Pas de "contracts" trouvé dans la réponse');
       }
+    } else {
+      console.log(`🔴 [DEBUG] CONTRACT FAILED:`, contRes.reason?.message);
     }
 
-    // Adresse
+    // 2. DEBUG ADRESSE
     if (addrRes.status === 'fulfilled') {
       const data = addrRes.value.data;
+      console.log(`\n🔵 [DEBUG] RAW ADDRESS RESPONSE (${usage_point_id}):\n`, JSON.stringify(data, null, 2));
+
       const up = data.customer?.usage_points?.[0];
       const addr = up?.usage_point?.usage_point_addresses || up?.address;
       if (addr) address = { street: addr.street, postal_code: addr.postal_code, city: addr.city };
+    } else {
+      console.log(`🔴 [DEBUG] ADDRESS FAILED:`, addrRes.reason?.message);
     }
 
-    // Identité
+    // 3. DEBUG IDENTITÉ
     if (idRes.status === 'fulfilled') {
-      const p = idRes.value.data?.identity?.natural_person;
+      const data = idRes.value.data;
+      console.log(`\n🔵 [DEBUG] RAW IDENTITY RESPONSE (${usage_point_id}):\n`, JSON.stringify(data, null, 2));
+
+      const p = data?.identity?.natural_person;
       if (p) identity = { firstname: p.firstname, lastname: p.lastname };
+    } else {
+      console.log(`🔴 [DEBUG] IDENTITY FAILED:`, idRes.reason?.message);
     }
 
-    // Contact
+    // 4. DEBUG CONTACT
     if (contactRes.status === 'fulfilled') {
-      const c = contactRes.value.data?.contact_data;
+      const data = contactRes.value.data;
+      console.log(`\n🔵 [DEBUG] RAW CONTACT RESPONSE (${usage_point_id}):\n`, JSON.stringify(data, null, 2));
+
+      const c = data?.contact_data;
       if (c) contact = { email: c.email, phone: c.phone };
+    } else {
+      console.log(`🔴 [DEBUG] CONTACT FAILED:`, contactRes.reason?.message);
     }
+    
+    console.log('--------------------------------------------------\n');
+
   } catch (e) {
     console.error(`Erreur UserInfo ${usage_point_id}:`, e.message);
   }
@@ -189,12 +205,12 @@ async function fetchMeteringInternal(usage_point_id, providedToken, type, apiSuf
 app.get('/callback', (req, res) => {
   const { code, state, usage_point_id, error } = req.query;
   console.log('╔════════════════════════════════════════════╗');
-  console.log('║     ✅ CONSENTEMENT ENEDIS REÇU            ║');
+  console.log('║   ✅ CONSENTEMENT ENEDIS REÇU            ║');
   console.log('╠════════════════════════════════════════════╣');
-  console.log('║ PRM           →', usage_point_id);
-  console.log('║ Code          →', code);
-  console.log('║ State         →', state);
-  console.log('║ Error         →', error);
+  console.log('║ PRM          →', usage_point_id);
+  console.log('║ Code         →', code);
+  console.log('║ State        →', state);
+  console.log('║ Error        →', error);
   console.log('╚════════════════════════════════════════════╝');
 
   if (error) return res.redirect(`https://panelyn.com/simulateur?error=${error}`);
