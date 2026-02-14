@@ -330,23 +330,25 @@ app.get('/health', (req, res) => res.json({ status: 'OK' }));
 
 const PORT = process.env.PORT || 3000;
 
-// === CALLBACK ENEDIS (obligatoire pour valider le consentement) ===
+// ====================== CALLBACK ENEDIS (pour Render) ======================
 app.get('/callback', (req, res) => {
-  const { usage_point_id, code, state, error } = req.query;
+  const { code, state, usage_point_id, error } = req.query;
 
-  console.log('=== CONSENTEMENT ENEDIS REÇU ===');
-  console.log('PRM :', usage_point_id);
-  console.log('Code (ignoré) :', code);
-  console.log('State :', state);
+  console.log('╔════════════════════════════════════════════╗');
+  console.log('║     ✅ CONSENTEMENT ENEDIS REÇU            ║');
+  console.log('╠════════════════════════════════════════════╣');
+  console.log('║ PRM           →', usage_point_id);
+  console.log('║ Code          →', code);
+  console.log('║ State         →', state);
+  console.log('║ Error         →', error);
+  console.log('╚════════════════════════════════════════════╝');
 
   if (error || !usage_point_id) {
-    return res.redirect('https://panelyn.com/simulateur?error=consentement_failed');
+    return res.redirect(`https://panelyn.com/simulateur?error=consentement_failed`);
   }
 
-  // Le simple fait que cette route soit appelée valide le consentement côté Enedis
-  // → À partir de maintenant, ton token applicatif aura accès aux données client du PRM
-
-  res.redirect(`https://panelyn.com/simulateur?prm=${usage_point_id}&consentement=ok`);
+  // Redirection vers Bubble avec le PRM
+  res.redirect(`https://panelyn.com/simulateur?consentement=ok&usage_point_id=${usage_point_id}`);
 });
 
 app.listen(PORT, () => console.log(`Serveur prêt sur port ${PORT}`));
