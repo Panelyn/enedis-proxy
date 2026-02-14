@@ -1,4 +1,4 @@
-// server.js - VERSION FINALE (FIX ERROR 406 + LOGS)
+// server.js - VERSION PROD (FIX MINUTES HC + 406 + HYBRID AUTH)
 require('dotenv').config();
 const express = require('express');
 const axios = require('axios');
@@ -12,7 +12,7 @@ app.use(express.json());
 app.use(cors());
 app.set('trust proxy', 1);
 
-// CONFIG
+// --- CONFIGURATION ---
 const ENEDIS_CLIENT_ID = process.env.ENEDIS_CLIENT_ID;
 const ENEDIS_CLIENT_SECRET = process.env.ENEDIS_CLIENT_SECRET;
 const ENEDIS_BASE_URL = 'https://gw.ext.prod.api.enedis.fr';
@@ -20,34 +20,59 @@ const TOKEN_ENDPOINT = `${ENEDIS_BASE_URL}/oauth2/v3/token`;
 
 let appTokenCache = { token: null, expiresAt: 0 };
 
+// Rate Limiters
 const secondLimiter = rateLimit({ windowMs: 1000, max: 10 });
 const hourLimiter = rateLimit({ windowMs: 60 * 60 * 1000, max: 10000 });
 
+// Utilitaire pour attendre
 const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
 
-const MOIS_FR = ["Janvier","Février","Mars","Avril","Mai","Juin","Juillet","Août","Septembre","Octobre","Novembre","Décembre"];
+const MOIS_FR = [
+  "Janvier", "Février", "Mars", "Avril", "Mai", "Juin",
+  "Juillet", "Août", "Septembre", "Octobre", "Novembre", "Décembre"
+];
 
 function getEmptyMonthsStructure() {
   const months = {};
-  MOIS_FR.forEach(m => months[m] = { total_kwh: 0, hp_kwh: 0, hc_kwh: 0 });
+  MOIS_FR.forEach(mois => {
+    months[mois] = { total_kwh: 0, hp_kwh: 0, hc_kwh: 0 };
+  });
   return months;
 }
 
-// SCHEMA
+function aggregateMonths(target, source) {
+    Object.keys(source).forEach(mois => {
+        if (target[mois] && source[mois]) {
+            target[mois].total_kwh += source[mois].total_kwh;
+            target[mois].hp_kwh += source[mois].hp_kwh;
+            target[mois].hc_kwh += source[mois].hc_kwh;
+        }
+    });
+}
+
+// --- SCHEMAS ---
 const baseSchema = Joi.object({
   usage_point_ids: Joi.array().items(Joi.string().pattern(/^\d{14}$/)).min(1).required(),
   access_token: Joi.string().optional().allow('')
 });
 
-// TOKEN
+// --- GESTION TOKEN ---
 async function getToken(providedToken = null) {
-  if (providedToken?.trim()) return providedToken;
+  // Si Token Utilisateur fourni (via Bubble), on l'utilise en priorité
+  if (providedToken && providedToken.trim() !== '') return providedToken;
+
+  // Sinon, Token Application (Fallback technique)
   const now = Date.now();
   if (appTokenCache.token && now < appTokenCache.expiresAt) return appTokenCache.token;
 
   try {
     const response = await axios.post(TOKEN_ENDPOINT,
-      new URLSearchParams({ grant_type: 'client_credentials', client_id: ENEDIS_CLIENT_ID, client_secret: ENEDIS_CLIENT_SECRET, scope: 'metering_data metering_data_contract_details' }),
+      new URLSearchParams({ 
+        grant_type: 'client_credentials', 
+        client_id: ENEDIS_CLIENT_ID, 
+        client_secret: ENEDIS_CLIENT_SECRET, 
+        scope: 'metering_data metering_data_contract_details' 
+      }),
       { headers: { 'Content-Type': 'application/x-www-form-urlencoded' }, timeout: 10000 }
     );
     appTokenCache.token = response.data.access_token;
@@ -59,42 +84,66 @@ async function getToken(providedToken = null) {
   }
 }
 
-// HEURES CREUSES
+// --- LOGIQUE HEURES CREUSES (ROBUSTE AUX MINUTES 1H38) ---
 function parseOffpeakHours(str) {
   if (!str) return [];
-  let s = str.toLowerCase().replace(/hc\s*[:=]?\s*/g, '').replace(/h00/g, 'h').replace(/:/g, 'h').trim();
+  // Nettoyage : "HC (1H38-7H38)" -> "1:38-7:38"
+  let s = str.toLowerCase()
+    .replace(/hc\s*[:=]?\s*/g, '') 
+    .replace(/[()]/g, '')          
+    .replace(/h/g, ':')            
+    .trim();
+  
+  // Découpage multiple séparateurs
   return s.split(/;|,|et/).map(p => p.trim()).filter(p => p.includes('-'));
 }
 
 function isTimeInOffpeak(date, periods) {
-  if (!periods.length) return false;
-  const t = date.getHours() * 60 + date.getMinutes();
+  if (!periods || !periods.length) return false;
+  
+  // Minute actuelle de la journée (0 à 1439)
+  const currentTotalMinutes = date.getHours() * 60 + date.getMinutes();
+  
   for (let range of periods) {
-    const [startPart, endPart] = range.split('-').map(p => p.trim());
-    let startH = parseInt(startPart.replace(/\D/g, ''));
-    let endH = parseInt(endPart.replace(/\D/g, ''));
-    const startMin = startH * 60;
-    const endMin = endH * 60;
+    const [startStr, endStr] = range.split('-').map(p => p.trim());
+    if (!startStr || !endStr) continue;
+
+    // Convertisseur "HH:MM" -> minutes
+    const toMinutes = (timeStr) => {
+      const parts = timeStr.split(':');
+      const h = parseInt(parts[0], 10) || 0;
+      const m = parseInt(parts[1], 10) || 0;
+      return h * 60 + m;
+    };
+
+    const startMin = toMinutes(startStr);
+    const endMin = toMinutes(endStr);
+
     if (endMin < startMin) {
-      if (t >= startMin || t < endMin) return true;
-    } else if (t >= startMin && t < endMin) return true;
+      // Cas passage minuit (ex: 22:00 à 06:00 ou 1:30 à 7:30 J+1)
+      if (currentTotalMinutes >= startMin || currentTotalMinutes < endMin) return true;
+    } else {
+      // Cas journée classique
+      if (currentTotalMinutes >= startMin && currentTotalMinutes < endMin) return true;
+    }
   }
   return false;
 }
 
-// === USER INFO (FIX 406: Ajout Header Accept) ===
+// --- RECUPERATION COMPLETE INFOS CLIENT ---
 async function getUserInfoInternal(usage_point_id, providedToken) {
   const token = await getToken(providedToken);
-  let address = { street: null, postal_code: null, city: null };
+  
+  let address = { street: null, postal_code: null, city: null, country: null };
   let contract = { offpeak_hours: null, subscribed_power: null };
   let identity = { firstname: null, lastname: null };
   let contact = { email: null, phone: null };
 
-  // HEADER OBLIGATOIRE POUR ENEDIS INFO CLIENT
+  // HEADER OBLIGATOIRE POUR EVITER ERREUR 406
   const config = { 
     headers: { 
         'Authorization': `Bearer ${token}`,
-        'Accept': 'application/json' // <--- LE FIX EST ICI
+        'Accept': 'application/json' 
     }, 
     params: { usage_point_id }, 
     timeout: 10000 
@@ -108,53 +157,59 @@ async function getUserInfoInternal(usage_point_id, providedToken) {
       axios.get(`${ENEDIS_BASE_URL}/customers_cd/v5/contact_data`, config)
     ]);
 
-    // 1. DEBUG CONTRAT
-    if (contRes.status === 'fulfilled') {
-      const data = contRes.value.data;
-      console.log(`\n🔵 [DEBUG] RAW CONTRACT (${usage_point_id}): OK`);
-      const up = data.customer?.usage_points?.[0];
-      const contracts = up?.contracts || up?.usage_point?.contracts;
-      if (contracts) {
-        contract.offpeak_hours = contracts.offpeak_hours;
-        contract.subscribed_power = contracts.subscribed_power;
-      }
-    } else {
-      console.log(`🔴 [DEBUG] CONTRACT FAILED:`, contRes.reason?.message);
-    }
-
-    // 2. DEBUG ADRESSE
+    // 1. ADRESSE
     if (addrRes.status === 'fulfilled') {
-      const data = addrRes.value.data;
-      const up = data.customer?.usage_points?.[0];
-      const addr = up?.usage_point?.usage_point_addresses || up?.address;
-      if (addr) address = { street: addr.street, postal_code: addr.postal_code, city: addr.city };
+      const up = addrRes.value.data?.customer?.usage_points?.[0]?.usage_point;
+      // Supporte les deux formats de réponse possibles
+      const d = up?.usage_point_addresses || up?.address; 
+      if (d) {
+        address.street = d.street || null;
+        address.postal_code = d.postal_code || null;
+        address.city = d.city || null;
+        address.country = d.country || null;
+      }
     }
 
-    // 3. DEBUG IDENTITÉ
+    // 2. CONTRAT
+    if (contRes.status === 'fulfilled') {
+      const up = contRes.value.data?.customer?.usage_points?.[0];
+      const ctr = up?.contracts || up?.usage_point?.contracts;
+      if (ctr) {
+        contract.offpeak_hours = ctr.offpeak_hours || null;
+        contract.subscribed_power = ctr.subscribed_power || null;
+      }
+    }
+
+    // 3. IDENTITÉ
     if (idRes.status === 'fulfilled') {
-      const data = idRes.value.data;
-      const p = data?.identity?.natural_person;
-      if (p) identity = { firstname: p.firstname, lastname: p.lastname };
+      const p = idRes.value.data?.identity?.natural_person;
+      if (p) {
+        identity.firstname = p.firstname || null;
+        identity.lastname = p.lastname || null;
+      }
     }
 
-    // 4. DEBUG CONTACT
+    // 4. CONTACT
     if (contactRes.status === 'fulfilled') {
-      const data = contactRes.value.data;
-      const c = data?.contact_data;
-      if (c) contact = { email: c.email, phone: c.phone };
+      const c = contactRes.value.data?.contact_data;
+      if (c) {
+        contact.email = c.email || null;
+        contact.phone = c.phone || null;
+      }
     }
-    
+
   } catch (e) {
-    console.error(`Erreur UserInfo ${usage_point_id}:`, e.message);
+    console.warn(`Info User partielle ou échouée pour ${usage_point_id}: ${e.message}`);
   }
 
   return { usage_point_id, address, contract, identity, contact };
 }
 
-// === FETCH METERING ===
+// --- RECUPERATION COURBES (EN KWH) ---
 async function fetchMeteringInternal(usage_point_id, providedToken, type, apiSuffix, startStr, endStr, offpeakStr) {
   const token = await getToken(providedToken);
   const allData = [];
+  
   let current = parseISO(startStr);
   const finalEnd = parseISO(endStr);
 
@@ -165,15 +220,17 @@ async function fetchMeteringInternal(usage_point_id, providedToken, type, apiSuf
     const chunkEnd = format(chunkEndDate, 'yyyy-MM-dd');
 
     try {
-      await sleep(150);
-      const res = await axios.get(`${ENEDIS_BASE_URL}/metering_data_${apiSuffix}/v5/${type}_load_curve`, {
-        headers: { Authorization: `Bearer ${token}` }, // Metering n'a pas besoin de Accept: application/json strict
-        params: { usage_point_id, start: chunkStart, end: chunkEnd },
-        timeout: 15000
+      await sleep(150); // Pause anti-ban
+      const res = await axios.get(`${ENEDIS_BASE_URL}/metering_data_${apiSuffix}/v5/${type}_load_curve`, { 
+          headers: { Authorization: `Bearer ${token}` }, // Metering n'a pas besoin de Accept strict
+          params: { usage_point_id, start: chunkStart, end: chunkEnd }, 
+          timeout: 15000 
       });
-      if (res.data?.meter_reading?.interval_reading) allData.push(...res.data.meter_reading.interval_reading);
+      if (res.data?.meter_reading?.interval_reading) {
+        allData.push(...res.data.meter_reading.interval_reading);
+      }
     } catch (err) {
-      if (err.response?.status === 401 || err.response?.status === 403) break;
+      if (err.response && (err.response.status === 401 || err.response.status === 403)) break;
     }
     current = startOfDay(addDays(chunkEndDate, 1));
   }
@@ -184,13 +241,18 @@ async function fetchMeteringInternal(usage_point_id, providedToken, type, apiSuf
   allData.forEach(entry => {
     if (!entry.date || !entry.value) return;
     const date = parseISO(entry.date);
-    const monthName = MOIS_FR[date.getMonth()];
+    const monthIndex = date.getMonth(); 
+    const monthName = MOIS_FR[monthIndex];
+    
+    // CONVERSION WH -> KWH
     const kwh = (parseFloat(entry.value) * 0.5) / 1000;
+    
     monthly[monthName].total_kwh += kwh;
     if (isTimeInOffpeak(date, periods)) monthly[monthName].hc_kwh += kwh;
     else monthly[monthName].hp_kwh += kwh;
   });
 
+  // Arrondis
   Object.keys(monthly).forEach(m => {
     monthly[m].total_kwh = Number(monthly[m].total_kwh.toFixed(2));
     monthly[m].hp_kwh = Number(monthly[m].hp_kwh.toFixed(2));
@@ -201,71 +263,9 @@ async function fetchMeteringInternal(usage_point_id, providedToken, type, apiSuf
   return { total_kwh: total, monthly };
 }
 
-// CALLBACK
-app.get('/callback', (req, res) => {
-  const { code, state, usage_point_id, error } = req.query;
-  if (error) return res.redirect(`https://panelyn.com/simulateur?error=${error}`);
-  res.redirect(`https://panelyn.com/simulateur?consentement=ok&usage_point_id=${usage_point_id || ''}`);
-});
-
-// GET-ALL
-app.post('/get-all', secondLimiter, hourLimiter, async (req, res) => {
-  const { error } = baseSchema.validate(req.body);
-  if (error) return res.status(400).json({ success: false, error: error.details[0].message });
-
-  const { usage_point_ids, access_token: providedToken } = req.body;
-  const startStr = format(subYears(new Date(), 1), 'yyyy-MM-dd');
-  const endStr = format(new Date(), 'yyyy-MM-dd');
-
-  const customersList = [];
-  const globalConso = { monthly: getEmptyMonthsStructure() };
-  const globalProd = { monthly: getEmptyMonthsStructure() };
-
-  for (const pdl of usage_point_ids) {
-    const userInfo = await getUserInfoInternal(pdl, providedToken);
-    customersList.push(userInfo);
-
-    const offpeakStr = userInfo.contract?.offpeak_hours || "HC (22H00-06H00)";
-
-    const conso = await fetchMeteringInternal(pdl, providedToken, 'consumption', 'clc', startStr, endStr, offpeakStr);
-    const prod = await fetchMeteringInternal(pdl, providedToken, 'production', 'plc', startStr, endStr, '')
-      .catch(() => ({ total_kwh: 0, monthly: getEmptyMonthsStructure() }));
-
-    Object.keys(conso.monthly).forEach(m => {
-      globalConso.monthly[m].total_kwh += conso.monthly[m].total_kwh;
-      globalConso.monthly[m].hp_kwh += conso.monthly[m].hp_kwh;
-      globalConso.monthly[m].hc_kwh += conso.monthly[m].hc_kwh;
-    });
-    Object.keys(prod.monthly).forEach(m => {
-      globalProd.monthly[m].total_kwh += prod.monthly[m].total_kwh;
-    });
-  }
-
-  const consoHpList = MOIS_FR.map(m => Number(globalConso.monthly[m].hp_kwh.toFixed(2)));
-  const consoHcList = MOIS_FR.map(m => Number(globalConso.monthly[m].hc_kwh.toFixed(2)));
-  const prodList = MOIS_FR.map(m => Number(globalProd.monthly[m].total_kwh.toFixed(2)));
-
-  res.json({
-    success: true,
-    period: { start: startStr, end: endStr },
-    customers_list: customersList,
-    global_data: {
-      totals_kwh: {
-        consumption: Number((consoHpList.reduce((a,b)=>a+b,0) + consoHcList.reduce((a,b)=>a+b,0)).toFixed(2)),
-        production: Number(prodList.reduce((a,b)=>a+b,0).toFixed(2)),
-        hp: Number(consoHpList.reduce((a,b)=>a+b,0).toFixed(2)),
-        hc: Number(consoHcList.reduce((a,b)=>a+b,0).toFixed(2))
-      },
-      lists_kwh: {
-        consumption_hp: consoHpList,
-        consumption_hc: consoHcList,
-        production: prodList
-      }
-    }
-  });
-});
-
-// GET USER INFO (Route Bubble)
+// =========================================================
+// ROUTE 1 : GET USER INFO (Pour verif Bubble)
+// =========================================================
 app.post('/get-user-info', secondLimiter, async (req, res) => {
     const { error } = baseSchema.validate(req.body);
     if (error) return res.status(400).json({ success: false, error: error.details[0].message });
@@ -279,6 +279,79 @@ app.post('/get-user-info', secondLimiter, async (req, res) => {
     }
   
     res.json({ success: true, customers: results });
+});
+
+// =========================================================
+// ROUTE 2 : GET ALL (Tout aggrégé en kWh)
+// =========================================================
+app.post('/get-all', secondLimiter, hourLimiter, async (req, res) => {
+  const { error } = baseSchema.validate(req.body);
+  if (error) return res.status(400).json({ success: false, error: error.details[0].message });
+
+  const { usage_point_ids, access_token: providedToken } = req.body;
+  const startStr = format(subYears(new Date(), 1), 'yyyy-MM-dd');
+  const endStr = format(new Date(), 'yyyy-MM-dd');
+
+  const globalConso = { monthly: getEmptyMonthsStructure(), offpeak_hours: new Set() };
+  const globalProd = { monthly: getEmptyMonthsStructure() };
+  
+  const customersList = [];
+
+  for (const pdl of usage_point_ids) {
+    // 1. Infos Client
+    const userInfo = await getUserInfoInternal(pdl, providedToken);
+    customersList.push(userInfo);
+
+    // 2. Gestion des heures creuses
+    let offpeakStr = userInfo.contract?.offpeak_hours;
+    if (!offpeakStr) offpeakStr = "HC (22H00-06H00)";
+    globalConso.offpeak_hours.add(offpeakStr);
+
+    // 3. Conso
+    const conso = await fetchMeteringInternal(pdl, providedToken, 'consumption', 'clc', startStr, endStr, offpeakStr);
+    aggregateMonths(globalConso.monthly, conso.monthly);
+
+    // 4. Prod
+    let prod;
+    try {
+        prod = await fetchMeteringInternal(pdl, providedToken, 'production', 'plc', startStr, endStr, '');
+    } catch (e) {
+        prod = { total_kwh: 0, monthly: getEmptyMonthsStructure() };
+    }
+    if (!prod.monthly || Object.keys(prod.monthly).length === 0) {
+        prod.monthly = getEmptyMonthsStructure();
+    }
+    aggregateMonths(globalProd.monthly, prod.monthly);
+  }
+
+  // --- TRANSFORMATION EN LISTES ---
+  const consoHpList = MOIS_FR.map(mois => Number(globalConso.monthly[mois].hp_kwh.toFixed(2)));
+  const consoHcList = MOIS_FR.map(mois => Number(globalConso.monthly[mois].hc_kwh.toFixed(2)));
+  const prodList = MOIS_FR.map(mois => Number(globalProd.monthly[mois].total_kwh.toFixed(2)));
+
+  const totalHp = Number(consoHpList.reduce((a, b) => a + b, 0).toFixed(2));
+  const totalHc = Number(consoHcList.reduce((a, b) => a + b, 0).toFixed(2));
+  const totalProd = Number(prodList.reduce((a, b) => a + b, 0).toFixed(2));
+
+  res.json({
+    success: true,
+    period: { start: startStr, end: endStr },
+    customers_list: customersList,
+    global_data: {
+        totals_kwh: {
+            consumption: Number((totalHp + totalHc).toFixed(2)),
+            production: totalProd,
+            hp: totalHp,
+            hc: totalHc
+        },
+        lists_kwh: {
+            consumption_hp: consoHpList,
+            consumption_hc: consoHcList,
+            production: prodList
+        },
+        offpeak_hours_detected: Array.from(globalConso.offpeak_hours)
+    }
+  });
 });
 
 app.get('/health', (req, res) => res.json({ status: 'OK' }));
