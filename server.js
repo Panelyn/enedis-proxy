@@ -1,4 +1,4 @@
-// server.js - VERSION "CLEAN OUTPUT" (HC PROPRES + LISTE)
+// server.js - VERSION "RE-CALIBRATION" (Ratio Daily/Curve)
 require('dotenv').config();
 const express = require('express');
 const axios = require('axios');
@@ -35,7 +35,7 @@ const MOIS_FR = [
 function getEmptyMonthsStructure() {
   const months = {};
   MOIS_FR.forEach(mois => {
-    months[mois] = { total_kwh: 0, hp_kwh: 0, hc_kwh: 0 };
+    months[mois] = { total_kwh: 0, hp_kwh: 0, hc_kwh: 0, correction_ratio: 1 };
   });
   return months;
 }
@@ -59,7 +59,6 @@ const baseSchema = Joi.object({
 // --- GESTION TOKEN ---
 async function getToken(providedToken = null) {
   if (providedToken && providedToken.trim() !== '') return providedToken;
-
   const now = Date.now();
   if (appTokenCache.token && now < appTokenCache.expiresAt) return appTokenCache.token;
 
@@ -85,7 +84,6 @@ async function getToken(providedToken = null) {
 // --- LOGIQUE HEURES CREUSES ---
 function parseOffpeakHours(str) {
   if (!str) return [];
-  // Nettoyage technique pour le calcul (H -> :)
   let s = str.toLowerCase()
     .replace(/hc\s*[:=]?\s*/g, '') 
     .replace(/[()]/g, '')          
@@ -121,7 +119,7 @@ function isTimeInOffpeak(date, periods) {
   return false;
 }
 
-// --- RECUPERATION COMPLETE INFOS CLIENT ---
+// --- RECUPERATION INFOS CLIENT ---
 async function getUserInfoInternal(usage_point_id, providedToken) {
   const token = await getToken(providedToken);
   
@@ -144,7 +142,6 @@ async function getUserInfoInternal(usage_point_id, providedToken) {
       axios.get(`${ENEDIS_BASE_URL}/customers_cd/v5/contact_data`, config)
     ]);
 
-    // 1. ADRESSE
     if (addrRes.status === 'fulfilled') {
       const up = addrRes.value.data?.customer?.usage_points?.[0]?.usage_point;
       const d = up?.usage_point_addresses || up?.address; 
@@ -156,23 +153,18 @@ async function getUserInfoInternal(usage_point_id, providedToken) {
       }
     }
 
-    // 2. CONTRAT (Avec nettoyage HC et création Liste)
     if (contRes.status === 'fulfilled') {
       const up = contRes.value.data?.customer?.usage_points?.[0];
       const ctr = up?.contracts || up?.usage_point?.contracts;
       if (ctr) {
-        // Nettoyage "HC (1H38-7H38)" -> "1H38-7H38"
         let rawHc = ctr.offpeak_hours || "";
         let cleanHc = rawHc.replace(/HC\s*[:=]?\s*/gi, '').replace(/[()]/g, '').trim();
-
-        contract.offpeak_hours = cleanHc || null; // Format Texte Propre
-        contract.offpeak_hours_list = cleanHc ? cleanHc.split(';').map(s => s.trim()) : []; // Format Liste
-        
+        contract.offpeak_hours = cleanHc || null;
+        contract.offpeak_hours_list = cleanHc ? cleanHc.split(';').map(s => s.trim()) : [];
         contract.subscribed_power = ctr.subscribed_power || null;
       }
     }
 
-    // 3. IDENTITÉ
     if (idRes.status === 'fulfilled') {
       const p = idRes.value.data?.identity?.natural_person;
       if (p) {
@@ -181,7 +173,6 @@ async function getUserInfoInternal(usage_point_id, providedToken) {
       }
     }
 
-    // 4. CONTACT
     if (contactRes.status === 'fulfilled') {
       const c = contactRes.value.data?.contact_data;
       if (c) {
@@ -191,29 +182,69 @@ async function getUserInfoInternal(usage_point_id, providedToken) {
     }
 
   } catch (e) {
-    console.warn(`Info User partielle ou échouée pour ${usage_point_id}: ${e.message}`);
+    console.warn(`Info User partielle: ${e.message}`);
   }
 
   return { usage_point_id, address, contract, identity, contact };
 }
 
-// --- RECUPERATION COURBES (EN KWH) ---
-async function fetchMeteringInternal(usage_point_id, providedToken, type, apiSuffix, startStr, endStr, offpeakStr) {
+// --- NOUVEAU: RECUPERATION DONNEES QUOTIDIENNES (OFFICIELLES) ---
+async function fetchDailyTotals(usage_point_id, token, type, startStr, endStr) {
+    // Determine l'URL : daily_consumption ou daily_production
+    const apiType = type === 'consumption' ? 'daily_consumption' : 'daily_production';
+    const apiSuffix = type === 'consumption' ? 'dc' : 'dp';
+    
+    // On peut souvent récupérer 1 an d'un coup pour le Daily, mais par sécurité on garde un chunk large (ex: 360 jours)
+    // Ici on tente la période entière, si ça fail, Enedis renverra une erreur, mais 1 an passe généralement.
+    
+    try {
+        const res = await axios.get(`${ENEDIS_BASE_URL}/metering_data_${apiSuffix}/v5/${apiType}`, { 
+            headers: { Authorization: `Bearer ${token}`, 'Accept': 'application/json' },
+            params: { usage_point_id, start: startStr, end: endStr }, 
+            timeout: 10000 
+        });
+
+        const dailyData = getEmptyMonthsStructure();
+        const intervals = res.data?.meter_reading?.interval_reading || [];
+
+        intervals.forEach(entry => {
+            if (!entry.date || !entry.value) return;
+            const date = parseISO(entry.date);
+            const monthIndex = date.getMonth();
+            const monthName = MOIS_FR[monthIndex];
+
+            // Valeur officielle en Wh, on convertit en kWh
+            const kwh = parseFloat(entry.value) / 1000;
+            dailyData[monthName].total_kwh += kwh;
+        });
+        
+        return dailyData;
+
+    } catch (e) {
+        console.warn(`Erreur Daily ${type} (Calibration impossible):`, e.message);
+        return null; // Si erreur, on ne pourra pas calibrer, on garde les données Load Curve
+    }
+}
+
+
+// --- RECUPERATION COURBES + CALIBRATION ---
+async function fetchMeteringInternal(usage_point_id, providedToken, type, curveSuffix, startStr, endStr, offpeakStr) {
   const token = await getToken(providedToken);
   const allData = [];
   
+  // 1. Fetch Load Curve (Détail HP/HC)
   let current = parseISO(startStr);
   const finalEnd = parseISO(endStr);
 
   while (current <= finalEnd) {
     const chunkStart = format(current, 'yyyy-MM-dd');
-    let chunkEndDate = addDays(current, 6);
+    let chunkEndDate = addDays(current, 6); // Load curve limité à 7 jours souvent
     if (chunkEndDate > finalEnd) chunkEndDate = finalEnd;
     const chunkEnd = format(chunkEndDate, 'yyyy-MM-dd');
 
     try {
       await sleep(150);
-      const res = await axios.get(`${ENEDIS_BASE_URL}/metering_data_${apiSuffix}/v5/${type}_load_curve`, { 
+      const res = await axios.get(`${ENEDIS_BASE_URL}/metering_data_${curveSuffix}/v5/${type}_load_curve`, { 
           headers: { Authorization: `Bearer ${token}` },
           params: { usage_point_id, start: chunkStart, end: chunkEnd }, 
           timeout: 15000 
@@ -227,15 +258,16 @@ async function fetchMeteringInternal(usage_point_id, providedToken, type, apiSuf
     current = startOfDay(addDays(chunkEndDate, 1));
   }
 
+  // 2. Aggrégation Load Curve (Calculé)
   const monthly = getEmptyMonthsStructure();
   const periods = parseOffpeakHours(offpeakStr);
 
   allData.forEach(entry => {
     if (!entry.date || !entry.value) return;
     const date = parseISO(entry.date);
-    const monthIndex = date.getMonth(); 
-    const monthName = MOIS_FR[monthIndex];
+    const monthName = MOIS_FR[date.getMonth()];
     
+    // Load Curve est en W moyenné sur 30min -> Wh = W * 0.5. Puis /1000 -> kWh
     const kwh = (parseFloat(entry.value) * 0.5) / 1000;
     
     monthly[monthName].total_kwh += kwh;
@@ -243,6 +275,28 @@ async function fetchMeteringInternal(usage_point_id, providedToken, type, apiSuf
     else monthly[monthName].hp_kwh += kwh;
   });
 
+  // 3. RECUPERATION TOTAL OFFICIEL (Daily) ET CALIBRATION
+  const officialMonthly = await fetchDailyTotals(usage_point_id, token, type, startStr, endStr);
+
+  if (officialMonthly) {
+      Object.keys(monthly).forEach(m => {
+          const calculatedTotal = monthly[m].total_kwh;
+          const officialTotal = officialMonthly[m].total_kwh;
+
+          // Si on a des données des deux côtés
+          if (calculatedTotal > 0 && officialTotal > 0) {
+              const ratio = officialTotal / calculatedTotal;
+              
+              // On applique le ratio pour que la somme HP+HC soit égale au Total Officiel
+              monthly[m].hp_kwh = monthly[m].hp_kwh * ratio;
+              monthly[m].hc_kwh = monthly[m].hc_kwh * ratio;
+              monthly[m].total_kwh = officialTotal; // On force le total exact
+              monthly[m].correction_ratio = ratio; // Pour info
+          }
+      });
+  }
+
+  // Arrondis finaux
   Object.keys(monthly).forEach(m => {
     monthly[m].total_kwh = Number(monthly[m].total_kwh.toFixed(2));
     monthly[m].hp_kwh = Number(monthly[m].hp_kwh.toFixed(2));
@@ -254,26 +308,20 @@ async function fetchMeteringInternal(usage_point_id, providedToken, type, apiSuf
 }
 
 // =========================================================
-// ROUTE 1 : GET USER INFO (Bubble Verif)
+// ROUTES
 // =========================================================
 app.post('/get-user-info', secondLimiter, async (req, res) => {
     const { error } = baseSchema.validate(req.body);
     if (error) return res.status(400).json({ success: false, error: error.details[0].message });
-  
     const { usage_point_ids, access_token } = req.body;
     const results = [];
-  
     for (const pdl of usage_point_ids) {
         const info = await getUserInfoInternal(pdl, access_token);
         results.push(info);
     }
-  
     res.json({ success: true, customers: results });
 });
 
-// =========================================================
-// ROUTE 2 : GET ALL (Aggrégation + Listes Clean)
-// =========================================================
 app.post('/get-all', secondLimiter, hourLimiter, async (req, res) => {
   const { error } = baseSchema.validate(req.body);
   if (error) return res.status(400).json({ success: false, error: error.details[0].message });
@@ -288,37 +336,31 @@ app.post('/get-all', secondLimiter, hourLimiter, async (req, res) => {
   const customersList = [];
 
   for (const pdl of usage_point_ids) {
-    // 1. Infos Client
     const userInfo = await getUserInfoInternal(pdl, providedToken);
     customersList.push(userInfo);
 
-    // 2. HC
     let offpeakStr = userInfo.contract?.offpeak_hours;
     if (!offpeakStr) offpeakStr = "HC (22H00-06H00)";
-    // On ajoute ici la version propre pour le global_data
     globalConso.offpeak_hours.add(offpeakStr);
 
-    // 3. Conso
+    // Conso (avec calibration DC)
     const conso = await fetchMeteringInternal(pdl, providedToken, 'consumption', 'clc', startStr, endStr, offpeakStr);
     aggregateMonths(globalConso.monthly, conso.monthly);
 
-    // 4. Prod
+    // Prod (avec calibration DP)
     let prod;
     try {
         prod = await fetchMeteringInternal(pdl, providedToken, 'production', 'plc', startStr, endStr, '');
     } catch (e) {
         prod = { total_kwh: 0, monthly: getEmptyMonthsStructure() };
     }
-    if (!prod.monthly || Object.keys(prod.monthly).length === 0) {
-        prod.monthly = getEmptyMonthsStructure();
-    }
     aggregateMonths(globalProd.monthly, prod.monthly);
   }
 
-  // --- TRANSFORMATION ---
-  const consoHpList = MOIS_FR.map(mois => Number(globalConso.monthly[mois].hp_kwh.toFixed(2)));
-  const consoHcList = MOIS_FR.map(mois => Number(globalConso.monthly[mois].hc_kwh.toFixed(2)));
-  const prodList = MOIS_FR.map(mois => Number(globalProd.monthly[mois].total_kwh.toFixed(2)));
+  // Transformation Listes (Prod en négatif)
+  const consoHpList = MOIS_FR.map(m => Number(globalConso.monthly[m].hp_kwh.toFixed(2)));
+  const consoHcList = MOIS_FR.map(m => Number(globalConso.monthly[m].hc_kwh.toFixed(2)));
+  const prodList = MOIS_FR.map(m => Number((globalProd.monthly[m].total_kwh * -1).toFixed(2)));
 
   const totalHp = Number(consoHpList.reduce((a, b) => a + b, 0).toFixed(2));
   const totalHc = Number(consoHcList.reduce((a, b) => a + b, 0).toFixed(2));
@@ -345,7 +387,12 @@ app.post('/get-all', secondLimiter, hourLimiter, async (req, res) => {
   });
 });
 
-app.get('/health', (req, res) => res.json({ status: 'OK' }));
+app.get('/callback', (req, res) => {
+  const { code, state, usage_point_id, error } = req.query;
+  if (error) return res.redirect(`https://panelyn.com/simulateur?error=${error}`);
+  res.redirect(`https://panelyn.com/simulateur?consentement=ok&usage_point_id=${usage_point_id || ''}`);
+});
 
+app.get('/health', (req, res) => res.json({ status: 'OK' }));
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log(`Serveur prêt sur port ${PORT}`));
