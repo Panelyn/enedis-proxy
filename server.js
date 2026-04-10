@@ -1,4 +1,4 @@
-// server.js - VERSION "RE-CALIBRATION" (Ratio Daily/Curve)
+// server.js - VERSION V6 (2026) + PREREQUIS + LOGS ERREURS VISIBLES
 require('dotenv').config();
 const express = require('express');
 const axios = require('axios');
@@ -20,23 +20,15 @@ const TOKEN_ENDPOINT = `${ENEDIS_BASE_URL}/oauth2/v3/token`;
 
 let appTokenCache = { token: null, expiresAt: 0 };
 
-// Rate Limiters
 const secondLimiter = rateLimit({ windowMs: 1000, max: 10 });
 const hourLimiter = rateLimit({ windowMs: 60 * 60 * 1000, max: 10000 });
 
-// Utilitaire pour attendre
 const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
-
-const MOIS_FR = [
-  "Janvier", "Février", "Mars", "Avril", "Mai", "Juin",
-  "Juillet", "Août", "Septembre", "Octobre", "Novembre", "Décembre"
-];
+const MOIS_FR = ["Janvier", "Février", "Mars", "Avril", "Mai", "Juin", "Juillet", "Août", "Septembre", "Octobre", "Novembre", "Décembre"];
 
 function getEmptyMonthsStructure() {
   const months = {};
-  MOIS_FR.forEach(mois => {
-    months[mois] = { total_kwh: 0, hp_kwh: 0, hc_kwh: 0, correction_ratio: 1 };
-  });
+  MOIS_FR.forEach(mois => months[mois] = { total_kwh: 0, hp_kwh: 0, hc_kwh: 0, correction_ratio: 1 });
   return months;
 }
 
@@ -50,7 +42,6 @@ function aggregateMonths(target, source) {
     });
 }
 
-// --- SCHEMAS ---
 const baseSchema = Joi.object({
   usage_point_ids: Joi.array().items(Joi.string().pattern(/^\d{14}$/)).min(1).required(),
   access_token: Joi.string().optional().allow('')
@@ -84,29 +75,20 @@ async function getToken(providedToken = null) {
 // --- LOGIQUE HEURES CREUSES ---
 function parseOffpeakHours(str) {
   if (!str) return [];
-  let s = str.toLowerCase()
-    .replace(/hc\s*[:=]?\s*/g, '') 
-    .replace(/[()]/g, '')          
-    .replace(/h/g, ':')            
-    .trim();
+  let s = str.toLowerCase().replace(/hc\s*[:=]?\s*/g, '').replace(/[()]/g, '').replace(/h/g, ':').trim();
   return s.split(/;|,|et/).map(p => p.trim()).filter(p => p.includes('-'));
 }
 
 function isTimeInOffpeak(date, periods) {
   if (!periods || !periods.length) return false;
   const currentTotalMinutes = date.getHours() * 60 + date.getMinutes();
-  
   for (let range of periods) {
     const [startStr, endStr] = range.split('-').map(p => p.trim());
     if (!startStr || !endStr) continue;
-
     const toMinutes = (timeStr) => {
       const parts = timeStr.split(':');
-      const h = parseInt(parts[0], 10) || 0;
-      const m = parseInt(parts[1], 10) || 0;
-      return h * 60 + m;
+      return (parseInt(parts[0], 10) || 0) * 60 + (parseInt(parts[1], 10) || 0);
     };
-
     const startMin = toMinutes(startStr);
     const endMin = toMinutes(endStr);
 
@@ -119,7 +101,23 @@ function isTimeInOffpeak(date, periods) {
   return false;
 }
 
-// --- RECUPERATION INFOS CLIENT ---
+// --- NOUVEAU PREREQUIS V6: SUBSCRIBED SERVICES ---
+async function callSubscribedServices(usage_point_id, token) {
+    try {
+        const config = { 
+            headers: { 'Authorization': `Bearer ${token}`, 'Accept': 'application/json', 'Content-Type': 'application/json' },
+            timeout: 10000 
+        };
+        // L'API attend l'identifiant de l'autorisation
+        const body = { usage_point_id: usage_point_id }; 
+        await axios.post(`${ENEDIS_BASE_URL}/subscribed_services/v1`, body, config);
+        console.log(`✅ [V6] Prérequis subscribed_services OK pour ${usage_point_id}`);
+    } catch (e) {
+        console.error(`⚠️ [V6] Erreur subscribed_services (${usage_point_id}):`, e.response?.status, JSON.stringify(e.response?.data || e.message));
+    }
+}
+
+// --- RECUPERATION INFOS CLIENT (API V6) ---
 async function getUserInfoInternal(usage_point_id, providedToken) {
   const token = await getToken(providedToken);
   
@@ -135,70 +133,70 @@ async function getUserInfoInternal(usage_point_id, providedToken) {
   };
 
   try {
-    const [addrRes, contRes, idRes, contactRes] = await Promise.allSettled([
-      axios.get(`${ENEDIS_BASE_URL}/customers_upa/v5/usage_points/addresses`, config),
-      axios.get(`${ENEDIS_BASE_URL}/customers_upc/v5/usage_points/contracts`, config),
-      axios.get(`${ENEDIS_BASE_URL}/customers_i/v5/identity`, config),
-      axios.get(`${ENEDIS_BASE_URL}/customers_cd/v5/contact_data`, config)
+    const [genRes, contratRes] = await Promise.allSettled([
+      axios.get(`${ENEDIS_BASE_URL}/donnees_generales_auto/v1`, config),
+      axios.get(`${ENEDIS_BASE_URL}/situation_contrat_auto/v1`, config)
     ]);
 
-    if (addrRes.status === 'fulfilled') {
-      const up = addrRes.value.data?.customer?.usage_points?.[0]?.usage_point;
-      const d = up?.usage_point_addresses || up?.address; 
+    // 1. DONNEES GENERALES (Adresse + Contact)
+    if (genRes.status === 'fulfilled') {
+      const data = genRes.value.data;
+      console.log(`🔵 [V6] DONNEES GENERALES REÇUES:`, JSON.stringify(data, null, 2));
+      
+      const up = data.customer?.usage_points?.[0]?.usage_point || data.usage_point || data;
+      const d = up?.usage_point_addresses || up?.address || data.adresse; 
       if (d) {
-        address.street = d.street || null;
-        address.postal_code = d.postal_code || null;
-        address.city = d.city || null;
-        address.country = d.country || null;
+        address.street = d.street || d.rue || null;
+        address.postal_code = d.postal_code || d.code_postal || null;
+        address.city = d.city || d.ville || null;
+        address.country = d.country || d.pays || null;
       }
+      
+      const idData = data.identity || data.identite || data.customer?.identity;
+      if (idData?.natural_person || idData?.personne_physique) {
+        const np = idData.natural_person || idData.personne_physique;
+        identity.firstname = np.firstname || np.prenom || null;
+        identity.lastname = np.lastname || np.nom || null;
+      }
+      
+      const contactData = data.contact_data || data.contact || data.customer?.contact_data;
+      if (contactData) {
+        contact.email = contactData.email || null;
+        contact.phone = contactData.phone || contactData.telephone || null;
+      }
+    } else {
+      console.error(`🔴 [V6] DONNEES GENERALES FAILED:`, genRes.reason?.response?.status, JSON.stringify(genRes.reason?.response?.data || genRes.reason?.message));
     }
 
-    if (contRes.status === 'fulfilled') {
-      const up = contRes.value.data?.customer?.usage_points?.[0];
-      const ctr = up?.contracts || up?.usage_point?.contracts;
+    // 2. CONTRAT
+    if (contratRes.status === 'fulfilled') {
+      const data = contratRes.value.data;
+      const up = data.customer?.usage_points?.[0] || data.usage_point || data;
+      const ctr = up?.contracts || up?.usage_point?.contracts || data.contrat;
       if (ctr) {
-        let rawHc = ctr.offpeak_hours || "";
+        let rawHc = ctr.offpeak_hours || ctr.heures_creuses || "";
         let cleanHc = rawHc.replace(/HC\s*[:=]?\s*/gi, '').replace(/[()]/g, '').trim();
         contract.offpeak_hours = cleanHc || null;
         contract.offpeak_hours_list = cleanHc ? cleanHc.split(';').map(s => s.trim()) : [];
-        contract.subscribed_power = ctr.subscribed_power || null;
+        contract.subscribed_power = ctr.subscribed_power || ctr.puissance_souscrite || null;
       }
-    }
-
-    if (idRes.status === 'fulfilled') {
-      const p = idRes.value.data?.identity?.natural_person;
-      if (p) {
-        identity.firstname = p.firstname || null;
-        identity.lastname = p.lastname || null;
-      }
-    }
-
-    if (contactRes.status === 'fulfilled') {
-      const c = contactRes.value.data?.contact_data;
-      if (c) {
-        contact.email = c.email || null;
-        contact.phone = c.phone || null;
-      }
+    } else {
+      console.error(`🔴 [V6] CONTRAT FAILED:`, contratRes.reason?.response?.status, JSON.stringify(contratRes.reason?.response?.data || contratRes.reason?.message));
     }
 
   } catch (e) {
-    console.warn(`Info User partielle: ${e.message}`);
+    console.error(`Erreur fatale UserInfo V6: ${e.message}`);
   }
 
   return { usage_point_id, address, contract, identity, contact };
 }
 
-// --- NOUVEAU: RECUPERATION DONNEES QUOTIDIENNES (OFFICIELLES) ---
+// --- RECUPERATION DONNEES QUOTIDIENNES (V6) ---
 async function fetchDailyTotals(usage_point_id, token, type, startStr, endStr) {
-    // Determine l'URL : daily_consumption ou daily_production
     const apiType = type === 'consumption' ? 'daily_consumption' : 'daily_production';
-    const apiSuffix = type === 'consumption' ? 'dc' : 'dp';
-    
-    // On peut souvent récupérer 1 an d'un coup pour le Daily, mais par sécurité on garde un chunk large (ex: 360 jours)
-    // Ici on tente la période entière, si ça fail, Enedis renverra une erreur, mais 1 an passe généralement.
     
     try {
-        const res = await axios.get(`${ENEDIS_BASE_URL}/metering_data_${apiSuffix}/v5/${apiType}`, { 
+        const res = await axios.get(`${ENEDIS_BASE_URL}/metering_data/${apiType}`, { 
             headers: { Authorization: `Bearer ${token}`, 'Accept': 'application/json' },
             params: { usage_point_id, start: startStr, end: endStr }, 
             timeout: 10000 
@@ -210,42 +208,36 @@ async function fetchDailyTotals(usage_point_id, token, type, startStr, endStr) {
         intervals.forEach(entry => {
             if (!entry.date || !entry.value) return;
             const date = parseISO(entry.date);
-            const monthIndex = date.getMonth();
-            const monthName = MOIS_FR[monthIndex];
-
-            // Valeur officielle en Wh, on convertit en kWh
-            const kwh = parseFloat(entry.value) / 1000;
-            dailyData[monthName].total_kwh += kwh;
+            const monthName = MOIS_FR[date.getMonth()];
+            dailyData[monthName].total_kwh += parseFloat(entry.value) / 1000;
         });
         
         return dailyData;
 
     } catch (e) {
-        console.warn(`Erreur Daily ${type} (Calibration impossible):`, e.message);
-        return null; // Si erreur, on ne pourra pas calibrer, on garde les données Load Curve
+        console.error(`🔴 [V6] DAILY FAILED (${type}):`, e.response?.status, JSON.stringify(e.response?.data || e.message));
+        return null; 
     }
 }
 
-
-// --- RECUPERATION COURBES + CALIBRATION ---
-async function fetchMeteringInternal(usage_point_id, providedToken, type, curveSuffix, startStr, endStr, offpeakStr) {
+// --- RECUPERATION COURBES + CALIBRATION (V6) ---
+async function fetchMeteringInternal(usage_point_id, providedToken, type, startStr, endStr, offpeakStr) {
   const token = await getToken(providedToken);
   const allData = [];
   
-  // 1. Fetch Load Curve (Détail HP/HC)
   let current = parseISO(startStr);
   const finalEnd = parseISO(endStr);
 
   while (current <= finalEnd) {
     const chunkStart = format(current, 'yyyy-MM-dd');
-    let chunkEndDate = addDays(current, 6); // Load curve limité à 7 jours souvent
+    let chunkEndDate = addDays(current, 6); 
     if (chunkEndDate > finalEnd) chunkEndDate = finalEnd;
     const chunkEnd = format(chunkEndDate, 'yyyy-MM-dd');
 
     try {
       await sleep(150);
-      const res = await axios.get(`${ENEDIS_BASE_URL}/metering_data_${curveSuffix}/v5/${type}_load_curve`, { 
-          headers: { Authorization: `Bearer ${token}` },
+      const res = await axios.get(`${ENEDIS_BASE_URL}/metering_data/${type}_load_curve`, { 
+          headers: { Authorization: `Bearer ${token}`, 'Accept': 'application/json' },
           params: { usage_point_id, start: chunkStart, end: chunkEnd }, 
           timeout: 15000 
       });
@@ -253,12 +245,12 @@ async function fetchMeteringInternal(usage_point_id, providedToken, type, curveS
         allData.push(...res.data.meter_reading.interval_reading);
       }
     } catch (err) {
+      console.error(`🔴 [V6] LOAD CURVE FAILED (${type}):`, err.response?.status, JSON.stringify(err.response?.data || err.message));
       if (err.response && (err.response.status === 401 || err.response.status === 403)) break;
     }
     current = startOfDay(addDays(chunkEndDate, 1));
   }
 
-  // 2. Aggrégation Load Curve (Calculé)
   const monthly = getEmptyMonthsStructure();
   const periods = parseOffpeakHours(offpeakStr);
 
@@ -267,7 +259,6 @@ async function fetchMeteringInternal(usage_point_id, providedToken, type, curveS
     const date = parseISO(entry.date);
     const monthName = MOIS_FR[date.getMonth()];
     
-    // Load Curve est en W moyenné sur 30min -> Wh = W * 0.5. Puis /1000 -> kWh
     const kwh = (parseFloat(entry.value) * 0.5) / 1000;
     
     monthly[monthName].total_kwh += kwh;
@@ -275,7 +266,6 @@ async function fetchMeteringInternal(usage_point_id, providedToken, type, curveS
     else monthly[monthName].hp_kwh += kwh;
   });
 
-  // 3. RECUPERATION TOTAL OFFICIEL (Daily) ET CALIBRATION
   const officialMonthly = await fetchDailyTotals(usage_point_id, token, type, startStr, endStr);
 
   if (officialMonthly) {
@@ -283,20 +273,16 @@ async function fetchMeteringInternal(usage_point_id, providedToken, type, curveS
           const calculatedTotal = monthly[m].total_kwh;
           const officialTotal = officialMonthly[m].total_kwh;
 
-          // Si on a des données des deux côtés
           if (calculatedTotal > 0 && officialTotal > 0) {
               const ratio = officialTotal / calculatedTotal;
-              
-              // On applique le ratio pour que la somme HP+HC soit égale au Total Officiel
               monthly[m].hp_kwh = monthly[m].hp_kwh * ratio;
               monthly[m].hc_kwh = monthly[m].hc_kwh * ratio;
-              monthly[m].total_kwh = officialTotal; // On force le total exact
-              monthly[m].correction_ratio = ratio; // Pour info
+              monthly[m].total_kwh = officialTotal; 
+              monthly[m].correction_ratio = ratio; 
           }
       });
   }
 
-  // Arrondis finaux
   Object.keys(monthly).forEach(m => {
     monthly[m].total_kwh = Number(monthly[m].total_kwh.toFixed(2));
     monthly[m].hp_kwh = Number(monthly[m].hp_kwh.toFixed(2));
@@ -315,7 +301,9 @@ app.post('/get-user-info', secondLimiter, async (req, res) => {
     if (error) return res.status(400).json({ success: false, error: error.details[0].message });
     const { usage_point_ids, access_token } = req.body;
     const results = [];
+    
     for (const pdl of usage_point_ids) {
+        await callSubscribedServices(pdl, access_token);
         const info = await getUserInfoInternal(pdl, access_token);
         results.push(info);
     }
@@ -336,6 +324,9 @@ app.post('/get-all', secondLimiter, hourLimiter, async (req, res) => {
   const customersList = [];
 
   for (const pdl of usage_point_ids) {
+    // 1. Prérequis V6 OBLIGATOIRE
+    await callSubscribedServices(pdl, providedToken);
+
     const userInfo = await getUserInfoInternal(pdl, providedToken);
     customersList.push(userInfo);
 
@@ -343,21 +334,18 @@ app.post('/get-all', secondLimiter, hourLimiter, async (req, res) => {
     if (!offpeakStr) offpeakStr = "HC (22H00-06H00)";
     globalConso.offpeak_hours.add(offpeakStr);
 
-    // Conso (avec calibration DC)
-    const conso = await fetchMeteringInternal(pdl, providedToken, 'consumption', 'clc', startStr, endStr, offpeakStr);
+    const conso = await fetchMeteringInternal(pdl, providedToken, 'consumption', startStr, endStr, offpeakStr);
     aggregateMonths(globalConso.monthly, conso.monthly);
 
-    // Prod (avec calibration DP)
     let prod;
     try {
-        prod = await fetchMeteringInternal(pdl, providedToken, 'production', 'plc', startStr, endStr, '');
+        prod = await fetchMeteringInternal(pdl, providedToken, 'production', startStr, endStr, '');
     } catch (e) {
         prod = { total_kwh: 0, monthly: getEmptyMonthsStructure() };
     }
     aggregateMonths(globalProd.monthly, prod.monthly);
   }
 
-  // Transformation Listes (Prod en négatif)
   const consoHpList = MOIS_FR.map(m => Number(globalConso.monthly[m].hp_kwh.toFixed(2)));
   const consoHcList = MOIS_FR.map(m => Number(globalConso.monthly[m].hc_kwh.toFixed(2)));
   const prodList = MOIS_FR.map(m => Number((globalProd.monthly[m].total_kwh * -1).toFixed(2)));
