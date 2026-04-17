@@ -3,7 +3,17 @@ require('dotenv').config();
 const express = require('express');
 const axios = require('axios');
 const Joi = require('joi');
-const { parseISO, startOfDay, addDays, format, subYears } = require('date-fns');
+// date-fns v4 hangs on require() with Node v24 — use native replacements
+function parseISO(str) { return new Date(str); }
+function startOfDay(d) { const r = new Date(d); r.setHours(0,0,0,0); return r; }
+function addDays(d, n) { const r = new Date(d); r.setDate(r.getDate() + n); return r; }
+function format(d, fmt) { // supports 'yyyy-MM-dd' only
+  const y = d.getFullYear();
+  const m = String(d.getMonth() + 1).padStart(2, '0');
+  const day = String(d.getDate()).padStart(2, '0');
+  return `${y}-${m}-${day}`;
+}
+function subYears(d, n) { const r = new Date(d); r.setFullYear(r.getFullYear() - n); return r; }
 const cors = require('cors');
 const rateLimit = require('express-rate-limit');
 
