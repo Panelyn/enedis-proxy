@@ -16,7 +16,16 @@ app.set('trust proxy', 1);
 const ENEDIS_CLIENT_ID = process.env.ENEDIS_CLIENT_ID;
 const ENEDIS_CLIENT_SECRET = process.env.ENEDIS_CLIENT_SECRET;
 const ENEDIS_BASE_URL = 'https://gw.ext.prod.api.enedis.fr';
-const TOKEN_ENDPOINT = `${ENEDIS_BASE_URL}/oauth2/v3/token`;
+
+// Fix: Enedis customer endpoints return malformed Accept-Encoding headers
+// that cause axios decompression to fail with ECONNRESET in recent Node versions.
+// We create an axios instance that disables automatic decompression.
+const enedisApi = axios.create({
+  baseURL: ENEDIS_BASE_URL,
+  timeout: 10000,
+  decompress: false,
+  headers: { 'Accept-Encoding': 'identity' }
+});
 
 let appTokenCache = { token: null, expiresAt: 0 };
 
@@ -63,14 +72,13 @@ async function getToken(providedToken = null) {
   if (appTokenCache.token && now < appTokenCache.expiresAt) return appTokenCache.token;
 
   try {
-    const response = await axios.post(TOKEN_ENDPOINT,
-      new URLSearchParams({ 
-        grant_type: 'client_credentials', 
-        client_id: ENEDIS_CLIENT_ID, 
-        client_secret: ENEDIS_CLIENT_SECRET, 
-        scope: 'metering_data metering_data_contract_details' 
+    const response = await enedisApi.post('/oauth2/v3/token',
+      new URLSearchParams({
+        grant_type: 'client_credentials',
+        client_id: ENEDIS_CLIENT_ID,
+        client_secret: ENEDIS_CLIENT_SECRET
       }),
-      { headers: { 'Content-Type': 'application/x-www-form-urlencoded' }, timeout: 10000 }
+      { headers: { 'Content-Type': 'application/x-www-form-urlencoded' } }
     );
     appTokenCache.token = response.data.access_token;
     appTokenCache.expiresAt = now + (response.data.expires_in - 300) * 1000;
@@ -136,11 +144,16 @@ async function getUserInfoInternal(usage_point_id, providedToken) {
 
   try {
     const [addrRes, contRes, idRes, contactRes] = await Promise.allSettled([
-      axios.get(`${ENEDIS_BASE_URL}/customers_upa/v5/usage_points/addresses`, config),
-      axios.get(`${ENEDIS_BASE_URL}/customers_upc/v5/usage_points/contracts`, config),
-      axios.get(`${ENEDIS_BASE_URL}/customers_i/v5/identity`, config),
-      axios.get(`${ENEDIS_BASE_URL}/customers_cd/v5/contact_data`, config)
+      enedisApi.get('/customers_upa/v5/usage_points/addresses', config),
+      enedisApi.get('/customers_upc/v5/usage_points/contracts', config),
+      enedisApi.get('/customers_i/v5/identity', config),
+      enedisApi.get('/customers_cd/v5/contact_data', config)
     ]);
+
+    // Debug logging
+    [['Address', addrRes], ['Contract', contRes], ['Identity', idRes], ['Contact', contactRes]].forEach(([name, r]) => {
+      if (r.status === 'rejected') console.warn(`${name} FAILED:`, r.reason?.code, r.reason?.message);
+    });
 
     if (addrRes.status === 'fulfilled') {
       const up = addrRes.value.data?.customer?.usage_points?.[0]?.usage_point;
@@ -194,10 +207,9 @@ async function fetchDailyTotals(usage_point_id, token, type, startStr, endStr) {
     const apiSuffix = type === 'consumption' ? 'dc' : 'dp';
     
     try {
-        const res = await axios.get(`${ENEDIS_BASE_URL}/metering_data_${apiSuffix}/v5/${apiType}`, { 
+        const res = await enedisApi.get(`/metering_data_${apiSuffix}/v5/${apiType}`, {
             headers: { Authorization: `Bearer ${token}`, 'Accept': 'application/json' },
-            params: { usage_point_id, start: startStr, end: endStr }, 
-            timeout: 10000 
+            params: { usage_point_id, start: startStr, end: endStr }
         });
 
         const dailyData = getEmptyMonthsStructure();
@@ -238,10 +250,10 @@ async function fetchMeteringInternal(usage_point_id, providedToken, type, curveS
 
     try {
       await sleep(150);
-      const res = await axios.get(`${ENEDIS_BASE_URL}/metering_data_${curveSuffix}/v5/${type}_load_curve`, { 
+      const res = await enedisApi.get(`/metering_data_${curveSuffix}/v5/${type}_load_curve`, {
           headers: { Authorization: `Bearer ${token}` },
-          params: { usage_point_id, start: chunkStart, end: chunkEnd }, 
-          timeout: 15000 
+          params: { usage_point_id, start: chunkStart, end: chunkEnd },
+          timeout: 15000
       });
       if (res.data?.meter_reading?.interval_reading) {
         allData.push(...res.data.meter_reading.interval_reading);
